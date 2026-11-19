@@ -82,7 +82,19 @@ uvx --from "git+https://github.com/txZheng/tianji-power-mcp.git" tianji-power-mc
 - [天机 API 概览](https://www.tjweather.com/info/doc/download/api/readme.html) —— 端点、错误码、调用频率
 - [JSON 格式 API 文档](https://www.tjweather.com/info/doc/download/api/weather/json.html) —— 要素码表与参数说明
 
-拿到 key 之后，凭据优先读环境变量，其次读工作区 `.env`（`.env` 已被 git 忽略，不会误提交）：
+拿到 key 之后，凭据由服务自己读取，**宿主的 JSON 配置里不需要出现任何密钥**：
+
+- 读取顺序：`环境变量` > 工作区 `.env`
+- 用 `pip install -e .`（源码方式）安装时，服务的 `PROJECT_ROOT` 就是仓库目录，因此**无论宿主把工作目录设成什么，都能读到仓库里的 `.env`**
+- 用 `pip install git+...`（非源码方式）安装时没有仓库目录，只能走环境变量
+
+`.env` 已被 git 忽略。建议再收紧权限，避免同机其它用户读到：
+
+```bash
+chmod 600 .env
+```
+
+内容格式：
 
 ```bash
 cp .env.example .env
@@ -204,15 +216,13 @@ WorkBuddy 支持两级 MCP 配置，按需选一个：
       "command": "/absolute/path/to/.venv/bin/python",
       "args": ["-m", "tianji_power_mcp.server"],
       "cwd": "/absolute/path/to/tianji-power-mcp",
-      "env": {
-        "TJW_API_KEY": "你的 key",
-        "TJW_SUBSCRIPTION_ID": "你的订阅 ID"
-      },
       "description": "天机气象 · 电力提示"
     }
   }
 }
 ```
+
+**凭据不写在这里。** 服务启动时会自己去仓库目录读 `.env`（上文的读取顺序），所以这份 JSON 里没有任何秘密，可以放心备份、截图、分享。只有在你用 `pip install git+...` 没克隆仓库时，才需要额外补 `"env": {"TJW_API_KEY": "...", "TJW_SUBSCRIPTION_ID": "..."}`。
 
 用 pip 安装的话把 `command` 改成 `tianji-power-mcp`、`args` 留空即可。配置格式参见 [WorkBuddy MCP 文档](https://www.workbuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/MCP-Guide)。
 
