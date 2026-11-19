@@ -72,7 +72,7 @@ tianji-power-mcp
 uvx --from "git+https://github.com/txZheng/tianji-power-mcp.git" tianji-power-mcp
 ```
 
-> 方式三没有项目目录，因此**无法读取 `.env`**，凭据要通过宿主的环境变量注入（见下文各宿主配置里的 `env` 字段）。
+> 方式三没有项目目录，因此**无法读取 `.tjweather-rc`**，凭据要通过宿主的环境变量注入（见下文各宿主配置里的 `env` 字段）。
 
 ## 配置凭据
 
@@ -84,21 +84,21 @@ uvx --from "git+https://github.com/txZheng/tianji-power-mcp.git" tianji-power-mc
 
 拿到 key 之后，凭据由服务自己读取，**宿主的 JSON 配置里不需要出现任何密钥**：
 
-- 读取顺序：`环境变量` > 工作区 `.env`
-- 用 `pip install -e .`（源码方式）安装时，服务的 `PROJECT_ROOT` 就是仓库目录，因此**无论宿主把工作目录设成什么，都能读到仓库里的 `.env`**
+- 读取顺序：`环境变量` > 凭据文件 `.tjweather-rc`（兼容旧的 `.env`）
+- 用 `pip install -e .`（源码方式）安装时，服务的 `PROJECT_ROOT` 就是仓库目录，因此**无论宿主把工作目录设成什么，都能读到仓库里的 `.tjweather-rc`**
 - 用 `pip install git+...`（非源码方式）安装时没有仓库目录，只能走环境变量
 
-`.env` 已被 git 忽略。建议再收紧权限，避免同机其它用户读到：
+`.tjweather-rc` 已被 git 忽略。建议再收紧权限，避免同机其它用户读到：
 
 ```bash
-chmod 600 .env
+chmod 600 .tjweather-rc
 ```
 
 内容格式：
 
 ```bash
-cp .env.example .env
-# 编辑 .env，填入你自己的 key 与订阅 ID
+cp .tjweather-rc.example .tjweather-rc
+# 编辑 .tjweather-rc，填入你自己的 key 与订阅 ID
 ```
 
 | 变量 | 必填 | 说明 |
@@ -131,7 +131,7 @@ python scripts/smoke_stdio.py
 |---|---|
 | `command` | `tianji-power-mcp`（pip 安装）或 `<REPO_DIR>/.venv/bin/python`（源码安装） |
 | `args` | pip 安装留空；源码安装为 `["-m", "tianji_power_mcp.server"]` |
-| `env` | `TJW_API_KEY`、`TJW_SUBSCRIPTION_ID`（若不用 `.env`） |
+| `env` | `TJW_API_KEY`、`TJW_SUBSCRIPTION_ID`（若不用凭据文件） |
 
 ### 让 agent 自己接入（推荐）
 
@@ -145,7 +145,7 @@ python scripts/smoke_stdio.py
    cd ~/mcp/tianji-power-mcp && python3 -m venv .venv && .venv/bin/pip install -e .
 
 2. 凭据：向我索取 API key 和订阅 ID（不要自己编，也不要写进任何会进 git 的文件），
-   写入 ~/mcp/tianji-power-mcp/.env：
+   写入 ~/mcp/tianji-power-mcp/.tjweather-rc：
      TJW_API_KEY=...
      TJW_SUBSCRIPTION_ID=...
 
@@ -222,7 +222,7 @@ WorkBuddy 支持两级 MCP 配置，按需选一个：
 }
 ```
 
-**凭据不写在这里。** 服务启动时会自己去仓库目录读 `.env`（上文的读取顺序），所以这份 JSON 里没有任何秘密，可以放心备份、截图、分享。只有在你用 `pip install git+...` 没克隆仓库时，才需要额外补 `"env": {"TJW_API_KEY": "...", "TJW_SUBSCRIPTION_ID": "..."}`。
+**凭据不写在这里。** 服务启动时会自己去仓库目录读 `.tjweather-rc`（上文的读取顺序），所以这份 JSON 里没有任何秘密，可以放心备份、截图、分享。只有在你用 `pip install git+...` 没克隆仓库时，才需要额外补 `"env": {"TJW_API_KEY": "...", "TJW_SUBSCRIPTION_ID": "..."}`。
 
 用 pip 安装的话把 `command` 改成 `tianji-power-mcp`、`args` 留空即可。配置格式参见 [WorkBuddy MCP 文档](https://www.workbuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/MCP-Guide)。
 
@@ -314,12 +314,12 @@ WorkBuddy 支持两级 MCP 配置，按需选一个：
 ## 项目结构
 
 ```
-.env.example     凭据模板（复制成 .env 后填写）
+.tjweather-rc.example  凭据模板（复制成 .tjweather-rc 后填写）
 LICENSE          MIT
 SECURITY.md      凭据处理与漏洞报告约定
 dsh-bundles/     DeepSeek Harness 用的配置型 bundle
 src/tianji_power_mcp/
-  config.py     配置与凭据（环境变量 > 工作区 .env）
+  config.py     配置与凭据（环境变量 > .tjweather-rc）
   elements.py   要素注册表（ALL_FIELDS / 已授权 / 已拒 / 别名）
   client.py     /v2 客户端：一次取齐 + 投影、预算、缓存、要素剔除
   derive.py     派生量：露点、风切变、轮毂风速、风力等级、降水相态

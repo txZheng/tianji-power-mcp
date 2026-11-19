@@ -1,4 +1,7 @@
 # 凭据与本地状态，绝不入库
+.tjweather-rc
+.tjweather-rc.*
+!*.example
 .env
 .runtime/
 .venv/

@@ -1,7 +1,11 @@
 """配置与凭据加载。
 
 规则：只用当前工作区里的文件，不依赖任何外部目录。
-优先级：环境变量 > 工作区 .env > 报错。
+优先级：环境变量 > 凭据文件 > 报错。
+
+凭据文件名固定为 `.tjweather-rc`（避免与其它项目的 `.env` 撞车）。
+也可以用环境变量 `TJW_CREDENTIAL_FILE` 指定其它路径。
+为兼容旧安装，找不到 `.tjweather-rc` 时仍会读 `.env`。
 """
 
 from __future__ import annotations
@@ -13,6 +17,10 @@ from pathlib import Path
 DEFAULT_BASE_URL = "https://api.tjweather.com/v2"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+CREDENTIAL_FILE = ".tjweather-rc"
+# 旧版本用的文件名，仅在没有 .tjweather-rc 时兜底
+LEGACY_CREDENTIAL_FILES = (".env",)
+
 _KEY_NAMES = ("TJW_API_KEY", "TIANJI_API_KEY")
 _SUB_NAMES = ("TJW_SUBSCRIPTION_ID", "real_sub_id", "TIANJI_SUBSCRIPTION_ID")
 
@@ -20,9 +28,20 @@ _SUB_NAMES = ("TJW_SUBSCRIPTION_ID", "real_sub_id", "TIANJI_SUBSCRIPTION_ID")
 DEFAULT_MAX_CALLS = int(os.environ.get("TJW_MAX_CALLS", "20"))
 
 
+def _candidate_files() -> list[Path]:
+    override = os.environ.get("TJW_CREDENTIAL_FILE")
+    if override:
+        return [Path(override).expanduser()]
+    candidates: list[Path] = []
+    for base in (PROJECT_ROOT, Path.cwd()):
+        for name in (CREDENTIAL_FILE, *LEGACY_CREDENTIAL_FILES):
+            candidates.append(base / name)
+    return candidates
+
+
 def _load_dotenv() -> None:
-    """把工作区 .env 读进 os.environ（不覆盖已存在的环境变量）。"""
-    for candidate in (PROJECT_ROOT / ".env", Path.cwd() / ".env"):
+    """把凭据文件读进 os.environ（不覆盖已存在的环境变量）。"""
+    for candidate in _candidate_files():
         if not candidate.is_file():
             continue
         for raw in candidate.read_text(encoding="utf-8").splitlines():
@@ -67,11 +86,11 @@ def load_settings() -> Settings:
     sub = _first(_SUB_NAMES)
     if not key:
         raise RuntimeError(
-            "缺少 API key：请在工作区 .env 里设置 TJW_API_KEY，或导出同名环境变量。"
+            f"缺少 API key：请在 {CREDENTIAL_FILE} 里设置 TJW_API_KEY，或导出同名环境变量。"
         )
     if not sub:
         raise RuntimeError(
-            "缺少订阅 ID：/v2 端点必须带 subscriptionId，请在工作区 .env 里设置 "
+            f"缺少订阅 ID：/v2 端点必须带 subscriptionId，请在 {CREDENTIAL_FILE} 里设置 "
             "TJW_SUBSCRIPTION_ID（或 real_sub_id）。"
         )
     return Settings(

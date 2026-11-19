@@ -275,6 +275,32 @@ class ClientOfflineTest(unittest.TestCase):
         self.assertEqual(client.calls, 0, "参数非法时不应消耗额度")
 
 
+class CredentialFileTest(unittest.TestCase):
+    def test_credential_file_override(self):
+        import os
+        import tempfile
+
+        from tianji_power_mcp.config import load_settings
+
+        path = Path(tempfile.mkdtemp(prefix="tianji-cred-")) / ".tjweather-rc"
+        path.write_text("TJW_API_KEY=test-key-x\nTJW_SUBSCRIPTION_ID=test-sub-x\n", encoding="utf-8")
+        watched = ("TJW_CREDENTIAL_FILE", "TJW_API_KEY", "TJW_SUBSCRIPTION_ID", "real_sub_id")
+        saved = {k: os.environ.get(k) for k in watched}
+        try:
+            for k in watched:
+                os.environ.pop(k, None)
+            os.environ["TJW_CREDENTIAL_FILE"] = str(path)
+            settings = load_settings()
+            self.assertEqual(settings.api_key, "test-key-x")
+            self.assertEqual(settings.subscription_id, "test-sub-x")
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
 class ServerRegistrationTest(unittest.TestCase):
     def test_tools_registered(self):
         import asyncio

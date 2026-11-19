@@ -2,13 +2,14 @@
 
 ## 凭据处理
 
-本项目的 API 凭据**只从环境变量或工作区 `.env` 读取**，且 `.env` 已在 `.gitignore` 中：
+本项目的 API 凭据**只从环境变量或凭据文件 `.tjweather-rc` 读取**，且该文件已在 `.gitignore` 中：
 
 ```
+.tjweather-rc
 .env
 ```
 
-- 仓库里**不含**任何真实 key 或订阅 ID；`.env.example` 只有占位符。
+- 仓库里**不含**任何真实 key 或订阅 ID；`.tjweather-rc.example` 只有占位符。
 - 运行时拒绝把凭据写进日志：`get_capability` 返回的 key 是掩码形式（`abcd***xy`）。
 - 请求以 query string 携带 key（服务端要求如此）。如果你的部署会记录 URL，请确保访问日志已脱敏。
 
@@ -16,7 +17,7 @@
 
 以下路径已在 `.gitignore` 中，如果你新增类似文件请一并忽略：
 
-- `.env` / `.env.*`（保留 `.env.example`）
+- `.tjweather-rc` / `.tjweather-rc.*`（保留 `.example`）与 `.env`
 - `.runtime/`（运行时黑名单缓存）
 - `.venv/`、`__pycache__/`、`*.egg-info/`、`build/`、`dist/`
 
