@@ -28,7 +28,7 @@
 - **一次取齐，按需计算**：同一坐标 + 同一窗口只发一次 API 请求，之后所有工具复用缓存，零额外请求
 - **要素注册表驱动**：未授权要素在组装请求前就被挡掉，不会因为一个坏字段让整次请求失败
 - **额度自保护**：进程级调用预算、缓存 TTL、非法参数在发请求前拦截
-- **离线可测**：36 项单元测试全部基于真实响应 fixture，不联网、不需要凭据
+- **离线可测**：43 项离线测试全部基于真实响应 fixture，不联网、不需要凭据
 
 ## 安装
 
@@ -325,6 +325,7 @@ WorkBuddy 支持两级 MCP 配置，按需选一个：
 .tjweather-rc.example  凭据模板（复制成 .tjweather-rc 后填写）
 LICENSE          MIT
 SECURITY.md      凭据处理与漏洞报告约定
+CHANGELOG.md     版本变更记录
 dsh-bundles/     DeepSeek Harness 用的配置型 bundle
 src/tianji_power_mcp/
   config.py     配置与凭据（环境变量 > .tjweather-rc）
@@ -335,7 +336,7 @@ src/tianji_power_mcp/
   power.py      风电理论出力（功率曲线）
   pv.py         光伏理论出力（辐照 × PR × 温度修正）
   server.py     MCP 工具定义
-tests/          36 项离线测试 + 真实响应 fixture
+tests/          43 项离线测试 + 真实响应 fixture
 scripts/        fetch_fixture.py（1 次额度）/ smoke_stdio.py（零额度）/ smoke_live.py（1 次额度）
 ```
 
@@ -348,6 +349,17 @@ scripts/        fetch_fixture.py（1 次额度）/ smoke_stdio.py（零额度）
 ```
 
 调试时**不要用 `print()`** 往 stdout 写东西——stdio 传输下 stdout 就是协议通道，会污染协议流。日志请写 `sys.stderr`。
+
+## 版本
+
+本仓库有两个版本号，改动时一起看：
+
+| 版本号 | 位置 | 含义 |
+|---|---|---|
+| Python 包 | `pyproject.toml`、`src/tianji_power_mcp/__init__.py` | 使用者安装到的版本，也是 `serverInfo.version` 报的值 |
+| DSH bundle | `dsh-bundles/tianji-power/package.json` | DeepSeek Harness 插件包版本，只在 bundle 内容变化时递增 |
+
+改完代码按[语义化版本](https://semver.org/lang/zh-CN/)递增（修 bug 加第三位、加功能加第二位、不兼容升主版本），并在 [CHANGELOG.md](CHANGELOG.md) 记一条。当前：Python 包 **0.1.1**，DSH bundle **1.0.1**。
 
 ## 许可
 
