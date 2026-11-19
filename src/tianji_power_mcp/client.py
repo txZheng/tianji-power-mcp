@@ -388,26 +388,23 @@ class TianjiClient:
         days = max(1, math.ceil(needed_hours / 24))
         days = min(days, self.settings.max_fetch_days)
 
-        raw = self._from_cache(key, window, resolution, days)
+        raw = None
+        hit = self._cache.get(key)
+        if hit and time.time() - hit[0] < CACHE_TTL_SECONDS:
+            cached = copy.copy(hit[1])
+            cached.cached = True
+            cached.calls = self.calls
+            if _covers(cached, window, resolution):
+                raw = cached
+            elif cached.fcst_days < self.settings.max_fetch_days:
+                # 缓存不够长：按缓存天数往上加一天，而不是重复请求同样长度
+                days = min(self.settings.max_fetch_days, max(days, cached.fcst_days + 1))
         if raw is None:
             raw = self._fetch_with_fallback(location, days, t_res)
             self._cache[key] = (time.time(), raw)
 
         raw = self._ensure_tail(location, raw, days, t_res, window, resolution)
         return self._trim(raw, window, resolution)
-
-    def _from_cache(self, key: tuple[str, str], window: Window, resolution: timedelta, days: int) -> Series | None:
-        hit = self._cache.get(key)
-        if not hit or time.time() - hit[0] >= CACHE_TTL_SECONDS:
-            return None
-        cached = copy.copy(hit[1])
-        cached.cached = True
-        cached.calls = self.calls
-        if _covers(cached, window, resolution):
-            return cached
-        if cached.fcst_days >= days:
-            return cached  # 已经取到上限，再请求也不会更长
-        return None
 
     def _fetch_with_fallback(self, location: str, days: int, t_res: str) -> Series:
         """订阅限制（20009/10006）时逐步降天数，尽量取到能取的长度。"""

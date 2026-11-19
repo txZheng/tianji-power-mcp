@@ -63,6 +63,22 @@ def rolling_window(hours: int, now: datetime | None = None, label: str = "") -> 
     return Window(start=base, end=base + timedelta(hours=hours), label=label or f"未来{hours}小时", kind="rolling")
 
 
+def future_days_window(days: int, now: datetime | None = None, label: str = "") -> Window:
+    """「未来 N 天」= 从此刻起，到第 N 个自然日结束。
+
+    不是滚动 N×24 小时：今晚剩余几个小时算搭头，但要完整包含明天起的 N 个自然日。
+    例：19 日 15:44 说「未来3天」→ [19日15:44, 23日00:00)，完整覆盖 20/21/22 三天。
+    """
+    base = (now or now_cst()).astimezone(CST)
+    day0 = base.replace(hour=0, minute=0, second=0, microsecond=0)
+    return Window(
+        start=base,
+        end=day0 + timedelta(days=max(1, int(days)) + 1),
+        label=label or f"未来{days}天",
+        kind="future_days",
+    )
+
+
 def calendar_window(day: datetime, start_hour: int = 0, end_hour: int = 24, label: str = "") -> Window:
     """某个自然日（或其中一段）的 00:00 起算窗口；end_hour=24 表示到次日 00:00。"""
     base = day.astimezone(CST).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -113,10 +129,10 @@ def parse_period(text: str | None, now: datetime | None = None) -> Window | None
 
     match = re.fullmatch(r"(?:未来|接下来|后面)?(\d{1,2}|[一二两三四五六七八九十])(天|日|d)", text, re.IGNORECASE)
     if match:
-        return rolling_window(_to_int(match.group(1)) * 24, base, label=raw)
+        return future_days_window(_to_int(match.group(1)), base, label=raw)
 
     if re.fullmatch(r"未来?(一|1)?(周|星期)", text):
-        return rolling_window(24 * 7, base, label=raw)
+        return future_days_window(7, base, label=raw)
 
     match = re.fullmatch(r"(今天|今日|明天|明日|后天|大后天|昨天|昨日)(上午|下午|白天|夜间|晚上|全天)?", text)
     if match:

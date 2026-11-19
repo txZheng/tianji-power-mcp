@@ -469,10 +469,24 @@ class WindowParseTest(unittest.TestCase):
         window = parse_period("未来24小时", self.NOW)
         self.assertEqual((window.start, window.end), (self.NOW, self.NOW + timedelta(hours=24)))
 
-    def test_rolling_days(self):
-        window = parse_period("未来7天", self.NOW)
-        self.assertEqual(window.hours, 168)
+    def test_future_days_covers_full_calendar_days(self):
+        window = parse_period("未来3天", self.NOW)
+        self.assertEqual(window.kind, "future_days")
+        self.assertEqual(iso(window.start), "2026-11-19T14:56+08:00")
+        self.assertEqual(iso(window.end), "2026-11-23T00:00+08:00", "要完整覆盖 20/21/22 三天")
+
+    def test_future_days_gap_hours_are_included(self):
+        window = parse_period("未来3天", self.NOW)
+        self.assertGreater(window.hours, 72, "今晚剩余的小时算搭头")
+
+    def test_future_hours_stays_rolling(self):
+        window = parse_period("未来24小时", self.NOW)
         self.assertEqual(window.kind, "rolling")
+        self.assertEqual(window.hours, 24)
+
+    def test_future_week_is_seven_full_days(self):
+        window = parse_period("未来一周", self.NOW)
+        self.assertEqual(iso(window.end), "2026-11-27T00:00+08:00")
 
     def test_today_and_tomorrow(self):
         self.assertEqual(iso(parse_period("今天", self.NOW).start), "2026-11-19T00:00+08:00")
