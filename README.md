@@ -25,12 +25,12 @@
 
 ## 特性
 
-- **一次取齐，按需计算**：同一坐标 + 同一窗口只发一次 API 请求，之后所有工具复用缓存，零额外请求
+- **一次取齐，按需计算**：同一坐标 + 同一窗口只发一次 API 请求，之后所有工具复用缓存，零额外请求；结果同时落盘，跨进程复用、按起报翻页（05:00 / 17:00）失效
 - **要素注册表驱动**：未授权要素在组装请求前就被挡掉，不会因为一个坏字段让整次请求失败
 - **起报对齐**：自动识别最新起报（05:00 / 17:00 切换）与可取时长，多要余量后裁到请求窗口；覆盖不足会明确报告，而不是悄悄少给
 - **逐日汇总**：`daily_summary` 按自然日聚合出日表，首/末日不足整天会标注时段，降水按小时率求和；可附逐日理论电量（演示模型）
 - **额度自保护**：进程级调用预算、缓存 TTL、非法参数在发请求前拦截；每次真实请求落盘台账，`get_capability` 可查今日用量
-- **离线可测**：72 项离线测试（真实响应 fixture + 合成数据），不联网、不需要凭据
+- **离线可测**：77 项离线测试（真实响应 fixture + 合成数据），不联网、不需要凭据；push 到 GitHub 后 CI 自动再跑一遍
 
 ## 安装
 
@@ -112,6 +112,7 @@ cp .tjweather-rc.example .tjweather-rc
 | `TJW_RUN_LAG_HOURS` | ❌ | 起报可用滞后，默认 9（08 时起报 17:00 可用、20 时起报次日 05:00 可用） |
 | `TJW_PAD_HOURS` | ❌ | 取数时多要的余量小时，默认 3 |
 | `TJW_MAX_FETCH_DAYS` | ❌ | 单次最多取几天，默认 10（订阅上限常见 5/10/15/30/45） |
+| `TJW_DISK_CACHE` | ❌ | 落盘缓存开关，默认开（设 `0` 关闭）：整段结果写盘跨进程复用，起报翻页（05:00/17:00）失效 |
 
 ## 启动
 
@@ -166,7 +167,7 @@ python scripts/smoke_stdio.py
 
 4. 自检（不消耗 API 额度）
    cd ~/mcp/tianji-power-mcp && .venv/bin/python scripts/smoke_stdio.py
-   应列出 5 个工具，其中包含 get_dataset。
+   应列出 6 个工具，其中包含 get_dataset 与 daily_summary。
 
 5. 回报：安装路径、服务名、工具列表、以及 get_capability 返回的已授权要素数量。
    注意：不要为了验证去跑 scripts/smoke_live.py，它会消耗 API 调用额度。
@@ -314,11 +315,11 @@ WorkBuddy 支持两级 MCP 配置，按需选一个：
 天机 `/v2` 一次返回该点位该窗口的全部要素，服务端不做字段级筛选。因此客户端的设计是：
 
 1. 首次访问某坐标时，把**全部已授权要素**拼成一个请求发出去
-2. 结果进缓存（键只含 `(坐标, 分辨率)`，TTL 10 分钟），同一坐标的后续提问优先命中
+2. 结果进两级缓存（键只含 `(坐标, 分辨率)`）：内存 TTL 10 分钟；落盘条目锚定起报，05:00 / 17:00 翻页才失效，跨进程复用
 3. 之后风电、光伏、理论出力、原始取数都从这份缓存里投影出需要的列
 4. 缓存比请求窗口长（起报锚定 + 余量），工具始终只取窗口内的行
 
-所以「先问风光提示，再问理论出力」总共只有 **1 次** API 调用。
+所以「先问风光提示，再问理论出力」总共只有 **1 次** API 调用；重启进程、换个会话再问，只要还没过翻页点，仍然是这 1 次。
 
 ## 支持的要素
 
@@ -360,6 +361,7 @@ LICENSE          MIT
 SECURITY.md      凭据处理与漏洞报告约定
 CHANGELOG.md     版本变更记录
 dsh-bundles/     DeepSeek Harness 用的配置型 bundle
+.github/         CI：push / PR 自动跑离线测试
 src/tianji_power_mcp/
   config.py     配置与凭据（环境变量 > .tjweather-rc）
   elements.py   要素注册表（ALL_FIELDS / 已授权 / 已拒 / 别名）
@@ -370,7 +372,7 @@ src/tianji_power_mcp/
   power.py      风电理论出力（功率曲线）
   pv.py         光伏理论出力（辐照 × PR × 温度修正）
   server.py     MCP 工具定义
-tests/          72 项离线测试 + 真实响应 fixture
+tests/          77 项离线测试 + 真实响应 fixture
 scripts/        fetch_fixture.py（1 次额度）/ smoke_stdio.py（零额度）/ smoke_live.py（1 次额度）
 ```
 
@@ -379,8 +381,10 @@ scripts/        fetch_fixture.py（1 次额度）/ smoke_stdio.py（零额度）
 ```bash
 .venv/bin/python -m unittest discover -s tests -t .   # 离线，零额度
 .venv/bin/python scripts/smoke_stdio.py               # 冒烟：握手 + tools/list
-.venv/bin/python scripts/smoke_live.py                # 端到端（消耗 1 次额度）
+.venv/bin/python scripts/smoke_live.py                # 端到端（消耗 1 次额度；盘上有有效条目时为 0 次）
 ```
+
+推送后 GitHub Actions（`.github/workflows/ci.yml`）会在 Python 3.10 / 3.13 上自动跑同一套离线测试。
 
 调试时**不要用 `print()`** 往 stdout 写东西——stdio 传输下 stdout 就是协议通道，会污染协议流。日志请写 `sys.stderr`。
 
@@ -394,7 +398,7 @@ scripts/        fetch_fixture.py（1 次额度）/ smoke_stdio.py（零额度）
 | `src/tianji_power_mcp/__init__.py` | 运行时版本，MCP 握手时作为 `serverInfo.version` 上报 |
 | `dsh-bundles/tianji-power/package.json` | DSH 插件包的 npm 版本，与包版本保持一致 |
 
-改完代码按[语义化版本](https://semver.org/lang/zh-CN/)递增（修 bug 加第三位、加功能加第二位、不兼容升主版本），在 [CHANGELOG.md](CHANGELOG.md) 记一条，再打同名 tag（如 `v0.1.1`）。当前：**0.3.0**。
+改完代码按[语义化版本](https://semver.org/lang/zh-CN/)递增（修 bug 加第三位、加功能加第二位、不兼容升主版本），在 [CHANGELOG.md](CHANGELOG.md) 记一条，再打同名 tag（如 `v0.1.1`）。当前：**0.4.0**。
 
 ## 许可
 

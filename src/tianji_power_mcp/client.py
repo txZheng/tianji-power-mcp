@@ -9,7 +9,7 @@
   拿到数据后用响应里的 `time_init` 与首末时间核对，尾部不够补取一次，
   最后裁到调用方要的窗口，并把覆盖情况（`coverage`）带回去。
 - **一次请求取齐**：全部已授权要素拼成一个请求，之后所有工具从同一份缓存投影。
-- **额度自保护**：进程级调用预算 + 缓存 + 参数前置校验。
+- **额度自保护**：进程级调用预算 + 缓存（内存 + 落盘，按起报翻页失效）+ 参数前置校验。
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 import re
 import time
 import urllib.error
@@ -28,12 +29,16 @@ from pathlib import Path
 
 from . import elements
 from .config import PROJECT_ROOT, Settings, load_settings
-from .window import Window, expected_run_init, iso, now_cst, rolling_window
+from .window import CST, Window, expected_run_init, iso, now_cst, rolling_window
 
 CACHE_TTL_SECONDS = 600.0
 DENIED_STORE = PROJECT_ROOT / ".runtime" / "denied.json"
 # 额度台账：每次真实请求（含失败尝试）追加一行，get_capability 可查累计/今日用量
 USAGE_STORE = PROJECT_ROOT / ".runtime" / "usage.jsonl"
+# 落盘缓存：整段取数结果写盘，跨进程复用；锚定起报，05:00/17:00 翻页即失效
+CACHE_DIR = PROJECT_ROOT / ".runtime" / "cache"
+# 落盘缓存的硬上限：有效条目天然不会超过一个起报周期（12 小时），24 小时只是兜底
+DISK_CACHE_MAX_AGE_SECONDS = 86400.0
 
 MAX_HOURS = 240
 MAX_START_HOUR = 72
@@ -222,12 +227,31 @@ def _row_time(row: dict) -> datetime | None:
         return None
 
 
+def _cache_filename(key: tuple[str, str]) -> str:
+    loc, t_res = key
+    return f"{loc.replace(',', '_')}_{t_res}.json"
+
+
+def _parse_run_init(value) -> datetime | None:
+    """把接口返回的 time_init 解析成带时区的时刻，用于判断起报是否翻页。"""
+    if not value:
+        return None
+    try:
+        moment = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=CST)
+    return moment.astimezone(CST)
+
+
 class TianjiClient:
     def __init__(
         self,
         settings: Settings | None = None,
         denied_store: Path | None = None,
         usage_store: Path | None = None,
+        cache_store: Path | None = None,
         now_fn=None,
     ):
         self.settings = settings or load_settings()
@@ -236,6 +260,7 @@ class TianjiClient:
         self._cache: dict[tuple[str, str], tuple[float, Series]] = {}
         self.denied_store = Path(denied_store) if denied_store else DENIED_STORE
         self.usage_store = Path(usage_store) if usage_store else USAGE_STORE
+        self.cache_dir = Path(cache_store) if cache_store else CACHE_DIR
         self.dynamic_denied: dict[str, str] = self._load_denied()
 
     # ---------- 额度与黑名单 ----------
@@ -303,6 +328,60 @@ class TianjiClient:
             "today_ok": today_ok,
             "note": "本地台账：统计真实发出的请求（含失败尝试），与 API 侧计费口径可能略有差异",
         }
+
+    # ---------- 落盘缓存 ----------
+
+    def _save_disk(self, key: tuple[str, str], series: Series) -> None:
+        """整段取数结果原子写盘，供之后的进程直接复用；失败不影响主流程。"""
+        if not self.settings.disk_cache:
+            return
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "saved_at": time.time(),
+                "run_time_init": series.time_init,
+                "fcst_days": series.fcst_days,
+                "fields": list(series.fields),
+                "units": dict(series.units),
+                "dropped": list(series.dropped),
+                "dataset_rows": series.dataset_rows,
+                "rows": series.rows,
+            }
+            path = self.cache_dir / _cache_filename(key)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def _load_disk(self, key: tuple[str, str], init_est: datetime) -> Series | None:
+        """读盘上的有效条目：起报一致（未翻页）且未超硬上限才可用。"""
+        if not self.settings.disk_cache:
+            return None
+        path = self.cache_dir / _cache_filename(key)
+        if not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if _parse_run_init(payload.get("run_time_init")) != init_est:
+            return None  # 起报已翻页：旧数据不能再当「最新」用
+        saved_at = payload.get("saved_at")
+        if not isinstance(saved_at, (int, float)) or time.time() - float(saved_at) > DISK_CACHE_MAX_AGE_SECONDS:
+            return None
+        rows = payload.get("rows")
+        if not isinstance(rows, list) or not rows:
+            return None
+        return Series(
+            rows=rows,
+            units=payload.get("units") or {},
+            fields=payload.get("fields") or [],
+            time_init=payload.get("run_time_init"),
+            dropped=payload.get("dropped") or [],
+            dataset_rows=int(payload.get("dataset_rows") or len(rows)),
+            fcst_days=int(payload.get("fcst_days") or 0),
+        )
 
     def _spend(self) -> None:
         if self.calls >= self.settings.max_calls:
@@ -459,8 +538,20 @@ class TianjiClient:
                 # 缓存不够长：按缓存天数往上加一天，而不是重复请求同样长度
                 days = min(self.settings.max_fetch_days, max(days, cached.fcst_days + 1))
         if raw is None:
+            disk = self._load_disk(key, init_est)
+            if disk is not None:
+                # 盘上条目有效：升格为内存缓存，本进程后续提问也走 L1
+                disk.calls = self.calls
+                self._cache[key] = (time.time(), disk)
+                if _covers(disk, window, resolution):
+                    raw = copy.copy(disk)
+                    raw.cached = True
+                elif disk.fcst_days < self.settings.max_fetch_days:
+                    days = min(self.settings.max_fetch_days, max(days, disk.fcst_days + 1))
+        if raw is None:
             raw = self._fetch_with_fallback(location, days, t_res)
             self._cache[key] = (time.time(), raw)
+            self._save_disk(key, raw)
 
         raw = self._ensure_tail(location, raw, days, t_res, window, resolution)
         return self._trim(raw, window, resolution)
@@ -503,7 +594,9 @@ class TianjiClient:
         bigger = self._fetch_with_fallback(location, min(base_days + 1, self.settings.max_fetch_days), t_res)
         bigger.retried = True
         lon, lat = parse_location(location)
-        self._cache[(f"{lon:.4f},{lat:.4f}", t_res)] = (time.time(), bigger)
+        key = (f"{lon:.4f},{lat:.4f}", t_res)
+        self._cache[key] = (time.time(), bigger)
+        self._save_disk(key, bigger)
         return bigger
 
     def _trim(self, raw: Series, window: Window, resolution: timedelta) -> Series:
@@ -556,6 +649,11 @@ class TianjiClient:
                 "max_fetch_days": self.settings.max_fetch_days,
                 "t_res_allowed": list(T_RES_ALLOWED),
                 "cache_ttl_seconds": CACHE_TTL_SECONDS,
+                "disk_cache": {
+                    "enabled": self.settings.disk_cache,
+                    "dir": str(self.cache_dir),
+                    "validity": "锚定起报：05:00/17:00 翻页即失效（另设 24 小时硬上限），跨进程复用、不额外消耗额度",
+                },
             },
             "run_anchor": {
                 "run_hours_cst": [8, 20],
@@ -572,7 +670,8 @@ class TianjiClient:
             },
             "strategy": (
                 "一次请求取齐全部已授权要素并缓存；风电/光伏/理论出力/原始取数都从同一份"
-                "缓存按需投影，同一坐标与窗口的后续提问不再产生请求。"
+                "缓存按需投影，同一坐标与窗口的后续提问不再产生请求；"
+                "整段结果同时落盘，跨进程按起报翻页（05:00/17:00）失效复用。"
             ),
             "usage": self.usage_summary(),
             "endpoint": self.settings.masked(),

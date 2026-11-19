@@ -34,6 +34,8 @@ DEFAULT_RUN_LAG_HOURS = float(os.environ.get("TJW_RUN_LAG_HOURS", "9"))
 DEFAULT_PAD_HOURS = int(os.environ.get("TJW_PAD_HOURS", "3"))
 # 单次最多取几天（订阅上限一般是 5/10/15/30/45 天，超了会返回 20009）。
 DEFAULT_MAX_FETCH_DAYS = int(os.environ.get("TJW_MAX_FETCH_DAYS", "10"))
+# 落盘缓存：整段取数结果写盘、跨进程复用，按起报翻页（05:00/17:00）失效。设 TJW_DISK_CACHE=0 关闭。
+DEFAULT_DISK_CACHE = os.environ.get("TJW_DISK_CACHE", "1") != "0"
 
 
 def _candidate_files() -> list[Path]:
@@ -82,6 +84,7 @@ class Settings:
     run_lag_hours: float = DEFAULT_RUN_LAG_HOURS
     pad_hours: int = DEFAULT_PAD_HOURS
     max_fetch_days: int = DEFAULT_MAX_FETCH_DAYS
+    disk_cache: bool = DEFAULT_DISK_CACHE
 
     def masked(self) -> dict[str, str]:
         return {
@@ -112,4 +115,5 @@ def load_settings() -> Settings:
         run_lag_hours=float(os.environ.get("TJW_RUN_LAG_HOURS", str(DEFAULT_RUN_LAG_HOURS))),
         pad_hours=int(os.environ.get("TJW_PAD_HOURS", str(DEFAULT_PAD_HOURS))),
         max_fetch_days=int(os.environ.get("TJW_MAX_FETCH_DAYS", str(DEFAULT_MAX_FETCH_DAYS))),
+        disk_cache=os.environ.get("TJW_DISK_CACHE", "1") != "0",
     )

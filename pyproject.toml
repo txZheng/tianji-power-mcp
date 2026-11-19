@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tianji-power-mcp"
-version = "0.3.0"
+version = "0.4.0"
 description = "天机气象 · 电力行业天气提示 MCP（大风/覆冰/低温/高温/强降水/云遮挡 + 理论出力演示）"
 readme = "README.md"
 license = { text = "MIT" }

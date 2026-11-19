@@ -213,6 +213,7 @@ class ClientOfflineTest(unittest.TestCase):
             SETTINGS,
             denied_store=Path(self._tmp) / "denied.json",
             usage_store=Path(self._tmp) / "usage.jsonl",
+            cache_store=Path(self._tmp) / "cache",
             now_fn=lambda: fixed_now,
         )
         queue = list(payloads)
@@ -571,6 +572,7 @@ class AnchoredFetchTest(unittest.TestCase):
             now_fn=lambda: self.NOW,
             denied_store=tmp / "denied.json",
             usage_store=tmp / "usage.jsonl",
+            cache_store=tmp / "cache",
         )
         client._request = api  # type: ignore[method-assign]
         return client
@@ -749,6 +751,7 @@ class UsageLedgerTest(unittest.TestCase):
             now_fn=lambda: self.NOW,
             denied_store=tmp / "denied.json",
             usage_store=tmp / "usage.jsonl",
+            cache_store=tmp / "cache",
         )
         client._request = api  # type: ignore[method-assign]
         return client
@@ -776,6 +779,94 @@ class UsageLedgerTest(unittest.TestCase):
         cap = client.capability()
         self.assertIn("usage", cap)
         self.assertEqual(cap["usage"]["today_calls"], 1)
+
+
+class DiskCacheTest(unittest.TestCase):
+    """落盘缓存：跨进程复用、起报翻页失效、窗口变长自动续取。"""
+
+    NOW = datetime(2026, 11, 19, 15, 0, tzinfo=CST)
+    INIT = datetime(2026, 11, 18, 20, 0, tzinfo=CST)
+
+    def _client(self, api, now=None, tmp=None):
+        tmp = Path(tmp or tempfile.mkdtemp(prefix="tianji-disk-"))
+        client = TianjiClient(
+            SETTINGS,
+            now_fn=lambda: (now or self.NOW),
+            denied_store=tmp / "denied.json",
+            usage_store=tmp / "usage.jsonl",
+            cache_store=tmp / "cache",
+        )
+        client._request = api  # type: ignore[method-assign]
+        return client
+
+    def test_survives_process_restart(self):
+        tmp = tempfile.mkdtemp(prefix="tianji-disk-restart-")
+        first = self._client(StubAPI(self.INIT), tmp=tmp)
+        series_a = first.series_for_window("112.55,37.87", rolling_window(12, self.NOW))
+        self.assertEqual(len(series_a.rows), 12)
+
+        # 新进程：内存缓存为空，只剩盘上的条目
+        api2 = StubAPI(self.INIT)
+        second = self._client(api2, tmp=tmp)
+        series_b = second.series_for_window("112.55,37.87", rolling_window(12, self.NOW))
+        second.series_for_window("112.55,37.87", rolling_window(12, self.NOW))  # 再问一次走 L1
+        self.assertEqual(second.calls, 0, "盘上有效条目应被复用，不再发请求")
+        self.assertEqual(api2.requests, [])
+        self.assertTrue(series_b.cached)
+        self.assertEqual(series_b.time_init, series_a.time_init)
+        self.assertEqual(len(series_b.rows), 12)
+
+    def test_invalid_after_run_flip(self):
+        tmp = tempfile.mkdtemp(prefix="tianji-disk-flip-")
+        self._client(StubAPI(self.INIT), tmp=tmp).series_for_window(
+            "112.55,37.87", rolling_window(12, self.NOW)
+        )
+        # 17:00 过后预期起报翻到 11-19 08:00，盘上的 11-18 20:00 条目必须失效
+        after_flip = datetime(2026, 11, 19, 18, 0, tzinfo=CST)
+        api2 = StubAPI(self.INIT)
+        second = self._client(api2, now=after_flip, tmp=tmp)
+        second.series_for_window("112.55,37.87", rolling_window(12, after_flip))
+        self.assertEqual(second.calls, 1, "翻页后必须重新取数")
+        self.assertEqual(api2.requests, [2])
+
+    def test_longer_window_extends_fetch(self):
+        tmp = tempfile.mkdtemp(prefix="tianji-disk-grow-")
+        self._client(StubAPI(self.INIT), tmp=tmp).series_for_window(
+            "112.55,37.87", rolling_window(12, self.NOW)
+        )
+        api2 = StubAPI(self.INIT)
+        second = self._client(api2, tmp=tmp)
+        series = second.series_for_window("112.55,37.87", rolling_window(60, self.NOW))
+        self.assertEqual(api2.requests, [4], "盘上 2 天盖不住 60 小时窗口，续取天数要往上加")
+        self.assertEqual(second.calls, 1)
+        self.assertTrue(series.coverage.complete)
+
+    def test_disk_cache_can_be_disabled(self):
+        import dataclasses
+
+        tmp = Path(tempfile.mkdtemp(prefix="tianji-disk-off-"))
+        client = TianjiClient(
+            dataclasses.replace(SETTINGS, disk_cache=False),
+            now_fn=lambda: self.NOW,
+            denied_store=tmp / "denied.json",
+            usage_store=tmp / "usage.jsonl",
+            cache_store=tmp / "cache",
+        )
+        client._request = StubAPI(self.INIT)
+        client.series_for_window("112.55,37.87", rolling_window(12, self.NOW))
+        files = list((tmp / "cache").glob("*")) if (tmp / "cache").exists() else []
+        self.assertEqual(files, [], "关闭落盘缓存后不应写任何文件")
+
+    def test_corrupt_entry_is_ignored(self):
+        tmp = Path(tempfile.mkdtemp(prefix="tianji-disk-bad-"))
+        cache_dir = tmp / "cache"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "112.5500_37.8700_1h.json").write_text("{not-json", encoding="utf-8")
+        api = StubAPI(self.INIT)
+        client = self._client(api, tmp=tmp)
+        series = client.series_for_window("112.55,37.87", rolling_window(12, self.NOW))
+        self.assertEqual(client.calls, 1, "损坏条目当作没有，正常取数")
+        self.assertEqual(len(series.rows), 12)
 
 
 if __name__ == "__main__":
