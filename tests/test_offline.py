@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -386,6 +387,133 @@ class LimitSemanticsTest(unittest.TestCase):
         result = self.srv.get_dataset("112.55,37.87", hours=4)
         self.assertEqual(self.fake.seen[-1]["fields"], elements.ALL_FIELDS)
         self.assertTrue(result["ok"])
+
+
+class BucketedFakeClient:
+    """模拟真实客户端：缓存按整天取数，工具按请求窗口裁行。"""
+
+    def __init__(self, rows: int = 24):
+        self.calls = 0
+        self.seen: list[dict] = []
+        self._rows = rows
+
+    def _series(self, fields):
+        from tianji_power_mcp.client import Series
+
+        rows = [
+            {
+                "time": f"2026-11-19T{i:02d}:00+08:00",
+                "t2m": 5.0,
+                "rh2m": 60.0,
+                "ws10m": 3.0,
+                "ws100m": 5.0,
+                "wd100m": 180.0,
+                "tp": 0.0,
+                "pres": 90000.0,
+                "psz": 90000.0,
+                "cldt": 0.1,
+                "cldl": 0.0,
+                "cldh": 0.0,
+                "ssrd": 100.0,
+            }
+            for i in range(self._rows)
+        ]
+        return Series(
+            rows=rows,
+            units={code: "u" for code in fields},
+            fields=list(fields),
+            time_init="2026-11-19T00:00+08:00",
+            calls=0,
+            dataset_rows=self._rows,
+        )
+
+    def dataset(self, location, hours=24, start_hour=0, t_res="1h"):
+        self.seen.append({"fields": list(elements.ALL_FIELDS), "hours": hours, "t_res": t_res})
+        return self._series(elements.ALL_FIELDS)
+
+    def query(self, location, fields, hours=24, start_hour=0, t_res="1h"):
+        self.seen.append({"fields": list(fields), "hours": hours, "t_res": t_res})
+        return self._series(fields).window(hours)
+
+
+class WindowSemanticsTest(unittest.TestCase):
+    """缓存按整天取数，但每个工具只分析调用方请求的时段；total_rows 报缓存完整行数。"""
+
+    def setUp(self):
+        from tianji_power_mcp import server as srv
+
+        self.srv = srv
+        self.fake = BucketedFakeClient(rows=24)
+        self._original = srv._client
+        srv._client = lambda: self.fake  # type: ignore[assignment]
+
+    def tearDown(self):
+        self.srv._client = self._original  # type: ignore[assignment]
+
+    def test_get_dataset_separates_window_from_cache(self):
+        data = self.srv.get_dataset("112.55,37.87", hours=10)["data"]
+        self.assertEqual(data["returned_rows"], 10)
+        self.assertEqual(data["window_rows"], 10)
+        self.assertEqual(data["total_rows"], 24, "total_rows 应是缓存完整行数")
+        self.assertFalse(data["truncated"], "窗口 10 行本就不截断")
+        self.assertIn("24", data["note"])
+
+    def test_limit_truncates_only_the_return(self):
+        data = self.srv.get_dataset("112.55,37.87", hours=10, limit=3)["data"]
+        self.assertEqual(data["returned_rows"], 3)
+        self.assertEqual(data["window_rows"], 10)
+        self.assertEqual(data["total_rows"], 24)
+        self.assertTrue(data["truncated"])
+
+    def test_snapshot_honours_requested_hours(self):
+        rows = self.srv.wind_solar_snapshot("112.55,37.87", hours=6)["data"]["rows"]
+        self.assertEqual(len(rows), 6, "快照不应把整天数据都返回")
+
+    def test_hint_honours_requested_hours(self):
+        result = self.srv.power_weather_hint("112.55,37.87", hours=6)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["window"]["hours"], 6)
+        self.assertEqual(result["data"]["window"]["last"], "2026-11-19T05:00+08:00")
+
+    def test_theoretical_power_honours_requested_hours(self):
+        result = self.srv.theoretical_power("112.55,37.87", hours=6, kind="wind")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["summary"]["hours"], 6)
+
+
+class ClientWindowTest(unittest.TestCase):
+    """真实客户端：一次取整天，投影与裁行都不发请求。"""
+
+    def test_query_slices_window_but_keeps_cache_total(self):
+        client = TianjiClient(SETTINGS)
+
+        def fake_request(params):
+            fields = str(params["fields"]).split(",")
+            rows = [
+                {"time": f"2026-11-19T{i:02d}:00+08:00", **{code: 1.0 for code in fields}}
+                for i in range(24)
+            ]
+            return {
+                "code": 200,
+                "data": {
+                    "time_init": "2026-11-19T00:00+08:00",
+                    "units": {code: "u" for code in fields},
+                    "data": rows,
+                },
+            }
+
+        client._request = fake_request  # type: ignore[assignment]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client.denied_store = Path(tmp) / "denied.json"
+            full = client.dataset("112.55,37.87", hours=10)
+            self.assertEqual(len(full.rows), 24, "缓存按整天取数")
+            self.assertEqual(full.dataset_rows, 24)
+
+            window = client.query("112.55,37.87", ["t2m", "ws10m"], hours=10)
+            self.assertEqual(len(window.rows), 10, "投影结果要按请求窗口裁行")
+            self.assertEqual(window.dataset_rows, 24)
+            self.assertEqual(client.calls, 1, "窗口裁剪不应产生额外请求")
 
 
 if __name__ == "__main__":

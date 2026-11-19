@@ -106,7 +106,7 @@ def power_weather_hint(
     try:
         series = _client().dataset(location, hours=hours, start_hour=start_hour).project(
             DEFAULT_FIELDS[scenario]
-        )
+        ).window(hours)
     except TianjiError as exc:
         return _error(exc)
     result = hints.detect(series.rows, scenario=scenario, cut_out=cut_out)
@@ -126,7 +126,7 @@ def wind_solar_snapshot(location: str, hours: int = 24, start_hour: int = 0, t_r
     try:
         series = _client().dataset(
             location, hours=hours, start_hour=start_hour, t_res=t_res
-        ).project(fields)
+        ).project(fields).window(hours)
     except TianjiError as exc:
         return _error(exc)
     rows = []
@@ -179,7 +179,7 @@ def theoretical_power(
             power.check_params(cut_in, rated, cut_out, hub_height, capacity_mw)
             series = _client().dataset(location, hours=hours, start_hour=start_hour).project(
                 ["ws10m", "ws100m", "t2m"]
-            )
+            ).window(hours)
             result = power.simulate(
                 series.rows,
                 hub_height=hub_height,
@@ -193,7 +193,7 @@ def theoretical_power(
             pv.check_params(capacity_mw, pr, -0.004, tilt_gain)
             series = _client().dataset(location, hours=hours, start_hour=start_hour).project(
                 ["ssrd", "t2m"]
-            )
+            ).window(hours)
             result = pv.simulate(
                 series.rows,
                 capacity_mw=capacity_mw,
@@ -240,21 +240,28 @@ def get_dataset(
     except TianjiError as exc:
         return _error(exc)
 
-    total = len(series.rows)
+    window_rows = len(series.rows)
+    # total_rows 指缓存里的完整数据集行数（窗口按整天向上取整），不是本次返回或本次窗口的行数
+    total = int(getattr(series, "dataset_rows", 0) or window_rows)
     cut = max(0, int(limit or 0))
     rows = series.rows[:cut] if cut > 0 else series.rows
-    note = (
-        f"完整数据集 {total} 行已缓存；本次仅返回前 {len(rows)} 行。"
-        "加工类工具（提示/快照/理论出力）始终使用完整数据，截断只影响本工具返回值。"
-        if len(rows) < total
-        else ""
-    )
+    notes: list[str] = []
+    if total > window_rows:
+        notes.append(
+            f"缓存完整数据集 {total} 行，本次窗口 {window_rows} 行，余量供同日其它提问复用"
+        )
+    if len(rows) < window_rows:
+        if total <= window_rows:
+            notes.append(f"完整数据集 {total} 行已缓存")
+        notes.append(f"limit 只截断本次返回：已返回前 {len(rows)} 行，其它工具仍用完整数据")
+    note = "；".join(notes) + "。" if notes else ""
     return _envelope(
         {
             "rows": rows,
+            "window_rows": window_rows,
             "total_rows": total,
             "returned_rows": len(rows),
-            "truncated": len(rows) < total,
+            "truncated": len(rows) < window_rows,
             "note": note,
             "unknown_fields": unknown,
             "denied_fields": {code: elements.DENIED.get(code, "未授权") for code in denied},

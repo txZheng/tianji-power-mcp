@@ -68,6 +68,8 @@ class Series:
     calls: int = 0
     cached: bool = False
     dropped: list[str] = field(default_factory=list)
+    # 缓存里的完整行数（按整天向上取整的窗口），用于区分"本次窗口行数"与"完整数据集行数"
+    dataset_rows: int = 0
 
     def project(self, wanted: list[str]) -> "Series":
         """从完整数据集里投影出需要的列，不产生任何请求。"""
@@ -85,7 +87,20 @@ class Series:
             calls=self.calls,
             cached=self.cached,
             dropped=[*self.dropped, *missing],
+            dataset_rows=self.dataset_rows,
         )
+
+    def window(self, hours: int) -> "Series":
+        """按调用方请求的时段裁剪行；缓存本身仍保留整天数据供同日复用。"""
+        try:
+            n = max(1, min(int(hours), MAX_HOURS))
+        except (TypeError, ValueError):
+            n = MAX_HOURS
+        if len(self.rows) <= n:
+            return self
+        trimmed = copy.copy(self)
+        trimmed.rows = self.rows[:n]
+        return trimmed
 
     def meta(self, client: "TianjiClient") -> dict:
         return {
@@ -294,6 +309,7 @@ class TianjiClient:
             time_init=time_init,
             calls=self.calls,
             dropped=dropped,
+            dataset_rows=len(rows),
         )
         self._cache[key] = (time.time(), series)
         result = copy.copy(series)
@@ -308,12 +324,9 @@ class TianjiClient:
         start_hour: int = 0,
         t_res: str = "1h",
     ) -> Series:
-        """按需投影：先拿完整数据集（可能 0 次请求），再裁列。"""
-        hours = max(1, min(int(hours), MAX_HOURS))
+        """按需投影：先拿完整数据集（可能 0 次请求），再裁列、再按请求窗口裁行。"""
         series = self.dataset(location, hours=hours, start_hour=start_hour, t_res=t_res)
-        projected = series.project(fields)
-        projected.rows = projected.rows[:hours]
-        return projected
+        return series.project(fields).window(hours)
 
     def capability(self) -> dict:
         return {
