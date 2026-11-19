@@ -1,28 +1,34 @@
 """天机 /v2 客户端（自包含，仅用标准库）。
 
-设计要点（v0.2 重构）
-- **一次请求拿齐**：首次取数就把全部已授权要素拼成一个请求发出去，之后所有工具
-  （风电/光伏/理论出力/原始取数）都从同一份缓存里**按需投影**，不再按场景拆请求。
-  同一坐标 + 同一窗口 + 同一分辨率，无论问几个问题，都只有一次网络请求。
-- 缓存键不含要素集合，只含 (坐标, 起始小时, 取数窗口, 分辨率)。
-- 要素必须来自注册表：20003 是整包拒绝，一个坏要素会让整次请求失败，故失败即剔除重试。
-- 万一要素数超过服务端上限（20011），自动二分重试，不浪费调用方重试。
-- 进程级调用预算 + 内存缓存（默认 10 分钟），额度有限时默认行为是**少发请求**。
+模板设计（v0.2，起报对齐版）
+- **数据锚在起报时刻**：接口只返回「最新」一次起报（北京时 08:00 / 20:00），
+  没有选择起报时次的参数；`fcst_days*24 + fcst_hours` 是**总时长**，数据从 `time_init + 1h` 开始。
+  所以「未来 24 小时」这类说法必须换算成「从起报算起够不够 24 小时」，否则拿到的是
+  「起报 +1h 起 24 小时」——最坏情况只有 3 小时落在未来。
+- **多要余量再裁剪**：按预期起报估算需要几天，额外多要 `pad_hours` 小时；
+  拿到数据后用响应里的 `time_init` 与首末时间核对，尾部不够补取一次，
+  最后裁到调用方要的窗口，并把覆盖情况（`coverage`）带回去。
+- **一次请求取齐**：全部已授权要素拼成一个请求，之后所有工具从同一份缓存投影。
+- **额度自保护**：进程级调用预算 + 缓存 + 参数前置校验。
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import math
+import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import elements
 from .config import PROJECT_ROOT, Settings, load_settings
+from .window import Window, expected_run_init, iso, now_cst, rolling_window
 
 CACHE_TTL_SECONDS = 600.0
 DENIED_STORE = PROJECT_ROOT / ".runtime" / "denied.json"
@@ -31,6 +37,7 @@ MAX_HOURS = 240
 MAX_START_HOUR = 72
 # 实测：3h 会被服务端拒绝（20010，仅提供 15min/1h）
 T_RES_ALLOWED = ("1h", "15min")
+_RESOLUTION = {"1h": timedelta(hours=1), "15min": timedelta(minutes=15)}
 
 
 class TianjiError(RuntimeError):
@@ -59,6 +66,52 @@ class BudgetExhausted(TianjiError):
     pass
 
 
+class FetchLimitExceeded(TianjiError):
+    """订阅限制（20009 / 10006）：请求的天数超过可查范围。"""
+
+
+@dataclass
+class Coverage:
+    """这次取到的数据相对请求窗口的覆盖情况。"""
+
+    requested_from: str
+    requested_to: str
+    run_time_init: str | None = None
+    data_from: str | None = None
+    data_to: str | None = None
+    complete: bool = True
+    missing_head_hours: int = 0
+    missing_tail_hours: int = 0
+    fcst_days: int = 0
+    retried: bool = False
+
+    def describe(self) -> dict:
+        text = "完整覆盖请求窗口" if self.complete else self._gap_text()
+        return {
+            "requested_from": self.requested_from,
+            "requested_to": self.requested_to,
+            "run_time_init": self.run_time_init,
+            "data_from": self.data_from,
+            "data_to": self.data_to,
+            "complete": self.complete,
+            "missing_head_hours": self.missing_head_hours,
+            "missing_tail_hours": self.missing_tail_hours,
+            "fcst_days": self.fcst_days,
+            "retried": self.retried,
+            "note": text,
+        }
+
+    def _gap_text(self) -> str:
+        parts = []
+        if self.missing_head_hours:
+            parts.append(
+                f"窗口开头 {self.missing_head_hours} 小时缺数据：晚于最新起报（{self.run_time_init}）的部分无法回补"
+            )
+        if self.missing_tail_hours:
+            parts.append(f"窗口末尾 {self.missing_tail_hours} 小时缺数据：超出可取的预报时长")
+        return "；".join(parts) or "覆盖不完整"
+
+
 @dataclass
 class Series:
     rows: list[dict] = field(default_factory=list)
@@ -68,8 +121,11 @@ class Series:
     calls: int = 0
     cached: bool = False
     dropped: list[str] = field(default_factory=list)
-    # 缓存里的完整行数（按整天向上取整的窗口），用于区分"本次窗口行数"与"完整数据集行数"
+    # 缓存里的完整行数（含窗口外余量）
     dataset_rows: int = 0
+    fcst_days: int = 0
+    coverage: Coverage | None = None
+    retried: bool = False
 
     def project(self, wanted: list[str]) -> "Series":
         """从完整数据集里投影出需要的列，不产生任何请求。"""
@@ -88,6 +144,9 @@ class Series:
             cached=self.cached,
             dropped=[*self.dropped, *missing],
             dataset_rows=self.dataset_rows,
+            fcst_days=self.fcst_days,
+            coverage=self.coverage,
+            retried=self.retried,
         )
 
     def window(self, hours: int) -> "Series":
@@ -103,7 +162,7 @@ class Series:
         return trimmed
 
     def meta(self, client: "TianjiClient") -> dict:
-        return {
+        body = {
             "rows": len(self.rows),
             "fields": self.fields,
             "units": self.units,
@@ -112,7 +171,11 @@ class Series:
             "calls_total": client.calls,
             "cache_hit": self.cached,
             "dropped_fields": self.dropped,
+            "fcst_days": self.fcst_days,
         }
+        if self.coverage:
+            body["coverage"] = self.coverage.describe()
+        return body
 
 
 def parse_location(location: str) -> tuple[float, float]:
@@ -147,11 +210,22 @@ def _bucket_hours(hours: int) -> int:
     return max(24, -(-hours // 24) * 24)
 
 
+def _row_time(row: dict) -> datetime | None:
+    stamp = row.get("time")
+    if not stamp:
+        return None
+    try:
+        return datetime.fromisoformat(str(stamp))
+    except ValueError:
+        return None
+
+
 class TianjiClient:
-    def __init__(self, settings: Settings | None = None, denied_store: Path | None = None):
+    def __init__(self, settings: Settings | None = None, denied_store: Path | None = None, now_fn=None):
         self.settings = settings or load_settings()
+        self._now = now_fn or now_cst
         self.calls = 0
-        self._cache: dict[tuple, tuple[float, Series]] = {}
+        self._cache: dict[tuple[str, str], tuple[float, Series]] = {}
         self.denied_store = Path(denied_store) if denied_store else DENIED_STORE
         self.dynamic_denied: dict[str, str] = self._load_denied()
 
@@ -214,31 +288,17 @@ class TianjiClient:
             raise AuthError(f"鉴权失败（{code}）：{message}")
         if code == 20001:
             raise AuthError(f"订阅参数缺失（{code}）：{message}")
+        if code in (20009, 10006):
+            raise FetchLimitExceeded(f"API 错误 code={code}：{message}")
         raise TianjiError(f"API 错误 code={code}：{message}")
 
-    # ---------- 一次取齐 ----------
+    # ---------- 一次取齐（按天） ----------
 
-    def dataset(
-        self,
-        location: str,
-        hours: int = 24,
-        start_hour: int = 0,
-        t_res: str = "1h",
-    ) -> Series:
-        """取回该窗口内**全部**已授权要素；命中缓存时零请求。"""
+    def _fetch_days(self, location: str, days: int, t_res: str) -> Series:
+        """取回从「起报 +1h」开始、共 `days*24` 小时的全部已授权要素。"""
         lon, lat = parse_location(location)
-        t_res = normalize_t_res(t_res)
-        hours = max(1, min(int(hours), MAX_HOURS))
-        start_hour = max(0, min(int(start_hour), MAX_START_HOUR))
-        bucket = _bucket_hours(hours)
-        key = (f"{lon:.4f},{lat:.4f}", start_hour, bucket, t_res)
-
-        hit = self._cache.get(key)
-        if hit and time.time() - hit[0] < CACHE_TTL_SECONDS:
-            cached = copy.copy(hit[1])
-            cached.cached = True
-            cached.calls = self.calls
-            return cached
+        days = max(1, min(int(days), self.settings.max_fetch_days))
+        want_rows = days * 24 * (4 if t_res == "15min" else 1)
 
         wanted = [code for code in elements.ALL_FIELDS if code not in self.dynamic_denied]
         if not wanted:
@@ -257,8 +317,8 @@ class TianjiClient:
             params = {
                 "fields": ",".join(attempt),
                 "loc": f"{lon},{lat}",
-                "fcst_days": bucket // 24,
-                "fcst_hours": start_hour,
+                "fcst_days": days,
+                "fcst_hours": 0,
                 "t_res": t_res,
                 "tz": self.settings.tz,
                 "key": self.settings.api_key,
@@ -301,8 +361,8 @@ class TianjiClient:
 
         fetch(wanted)
 
-        rows = [merged[stamp] for stamp in sorted(merged)][:bucket]
-        series = Series(
+        rows = [merged[stamp] for stamp in sorted(merged)][:want_rows]
+        return Series(
             rows=rows,
             units={k: units[k] for k in units if k in used},
             fields=used,
@@ -310,11 +370,110 @@ class TianjiClient:
             calls=self.calls,
             dropped=dropped,
             dataset_rows=len(rows),
+            fcst_days=days,
         )
-        self._cache[key] = (time.time(), series)
-        result = copy.copy(series)
-        result.calls = self.calls
-        return result
+
+    # ---------- 窗口取数 ----------
+
+    def series_for_window(self, location: str, window: Window, t_res: str = "1h") -> Series:
+        """按绝对窗口取数：多要余量 → 校验覆盖 → 裁到窗口内。"""
+        lon, lat = parse_location(location)
+        t_res = normalize_t_res(t_res)
+        resolution = _RESOLUTION[t_res]
+        key = (f"{lon:.4f},{lat:.4f}", t_res)
+
+        now = self._now()
+        init_est = expected_run_init(now, self.settings.run_lag_hours)
+        needed_hours = int(math.ceil((window.end - init_est).total_seconds() / 3600)) + self.settings.pad_hours
+        days = max(1, math.ceil(needed_hours / 24))
+        days = min(days, self.settings.max_fetch_days)
+
+        raw = self._from_cache(key, window, resolution, days)
+        if raw is None:
+            raw = self._fetch_with_fallback(location, days, t_res)
+            self._cache[key] = (time.time(), raw)
+
+        raw = self._ensure_tail(location, raw, days, t_res, window, resolution)
+        return self._trim(raw, window, resolution)
+
+    def _from_cache(self, key: tuple[str, str], window: Window, resolution: timedelta, days: int) -> Series | None:
+        hit = self._cache.get(key)
+        if not hit or time.time() - hit[0] >= CACHE_TTL_SECONDS:
+            return None
+        cached = copy.copy(hit[1])
+        cached.cached = True
+        cached.calls = self.calls
+        if _covers(cached, window, resolution):
+            return cached
+        if cached.fcst_days >= days:
+            return cached  # 已经取到上限，再请求也不会更长
+        return None
+
+    def _fetch_with_fallback(self, location: str, days: int, t_res: str) -> Series:
+        """订阅限制（20009/10006）时逐步降天数，尽量取到能取的长度。"""
+        attempt = max(1, int(days))
+        last_error: Exception | None = None
+        while attempt >= 1:
+            try:
+                return self._fetch_days(location, attempt, t_res)
+            except FetchLimitExceeded as exc:
+                last_error = exc
+                limit = _limit_days_from_error(str(exc))
+                attempt = limit if (limit and limit < attempt) else attempt - 1
+        if last_error:
+            raise last_error
+        raise TianjiError("取数失败：没有可用的天数")
+
+    def _ensure_tail(
+        self,
+        location: str,
+        raw: Series,
+        days: int,
+        t_res: str,
+        window: Window,
+        resolution: timedelta,
+    ) -> Series:
+        """尾部不够（发布延迟/估算偏乐观）时补取一次，最多加一天。"""
+        if raw.cached:
+            return raw
+        if _covers(raw, window, resolution):
+            return raw
+        coverage = _coverage(raw, window, resolution)
+        if coverage.missing_tail_hours <= 0:
+            return raw
+        if days >= self.settings.max_fetch_days or self.calls >= self.settings.max_calls:
+            return raw
+        base_days = raw.fcst_days or days
+        bigger = self._fetch_with_fallback(location, min(base_days + 1, self.settings.max_fetch_days), t_res)
+        bigger.retried = True
+        lon, lat = parse_location(location)
+        self._cache[(f"{lon:.4f},{lat:.4f}", t_res)] = (time.time(), bigger)
+        return bigger
+
+    def _trim(self, raw: Series, window: Window, resolution: timedelta) -> Series:
+        rows = []
+        for row in raw.rows:
+            moment = _row_time(row)
+            if moment is None:
+                continue
+            if window.start <= moment < window.end:
+                rows.append(row)
+        trimmed = copy.copy(raw)
+        trimmed.rows = rows
+        trimmed.coverage = _coverage(raw, window, resolution)
+        return trimmed
+
+    # ---------- 兼容接口 ----------
+
+    def dataset(
+        self,
+        location: str,
+        hours: int = 24,
+        start_hour: int = 0,
+        t_res: str = "1h",
+    ) -> Series:
+        """（兼容旧接口）从此刻起 `hours` 小时的完整要素集。"""
+        return self.series_for_window(location, rolling_window(hours, self._now()), t_res)
 
     def query(
         self,
@@ -324,9 +483,9 @@ class TianjiClient:
         start_hour: int = 0,
         t_res: str = "1h",
     ) -> Series:
-        """按需投影：先拿完整数据集（可能 0 次请求），再裁列、再按请求窗口裁行。"""
-        series = self.dataset(location, hours=hours, start_hour=start_hour, t_res=t_res)
-        return series.project(fields).window(hours)
+        """（兼容旧接口）按需投影：先按窗口取数，再裁列。"""
+        series = self.series_for_window(location, rolling_window(hours, self._now()), t_res)
+        return series.project(fields)
 
     def capability(self) -> dict:
         return {
@@ -338,9 +497,22 @@ class TianjiClient:
                 "max_calls_per_process": self.settings.max_calls,
                 "calls_used": self.calls,
                 "hours_max": MAX_HOURS,
-                "start_hour_max": MAX_START_HOUR,
+                "max_fetch_days": self.settings.max_fetch_days,
                 "t_res_allowed": list(T_RES_ALLOWED),
                 "cache_ttl_seconds": CACHE_TTL_SECONDS,
+            },
+            "run_anchor": {
+                "run_hours_cst": [8, 20],
+                "switch_at_cst": ["05:00", "17:00"],
+                "assumed_lag_hours": self.settings.run_lag_hours,
+                "pad_hours": self.settings.pad_hours,
+                "now": iso(now_cst()),
+                "expected_run_init": iso(expected_run_init(now_cst(), self.settings.run_lag_hours)),
+                "note": (
+                    "接口只返回最新一次起报，没有选择起报时次的参数；数据锚在 time_init+1h。"
+                    "08 时起报约 17:00 可用、20 时起报约次日 05:00 可用（切换点 05:00 / 17:00）。"
+                    "客户端按「预期起报 + 余量」取数，再用响应里的 time_init 校正覆盖情况。"
+                ),
             },
             "strategy": (
                 "一次请求取齐全部已授权要素并缓存；风电/光伏/理论出力/原始取数都从同一份"
@@ -348,6 +520,50 @@ class TianjiClient:
             ),
             "endpoint": self.settings.masked(),
         }
+
+
+def _covers(series: Series, window: Window, resolution: timedelta) -> bool:
+    if not series.rows:
+        return False
+    first = _row_time(series.rows[0])
+    last = _row_time(series.rows[-1])
+    if first is None or last is None:
+        return False
+    return first <= window.start and last + resolution >= window.end
+
+
+def _coverage(series: Series, window: Window, resolution: timedelta) -> Coverage:
+    first = _row_time(series.rows[0]) if series.rows else None
+    last = _row_time(series.rows[-1]) if series.rows else None
+    head = tail = 0
+    if first is not None and first > window.start:
+        head = int(math.ceil((first - window.start).total_seconds() / 3600))
+    if last is not None:
+        data_end = last + resolution
+        if data_end < window.end:
+            tail = int(math.ceil((window.end - data_end).total_seconds() / 3600))
+    else:
+        tail = window.hours
+        head = window.hours
+    return Coverage(
+        requested_from=iso(window.start),
+        requested_to=iso(window.end),
+        run_time_init=series.time_init,
+        data_from=iso(first) if first else None,
+        data_to=iso(last) if last else None,
+        complete=(head == 0 and tail == 0),
+        missing_head_hours=head,
+        missing_tail_hours=tail,
+        fcst_days=series.fcst_days,
+        retried=series.retried,
+    )
+
+
+def _limit_days_from_error(message: str) -> int | None:
+    match = re.search(r"最多查询\s*(\d+)\s*天", message)
+    if match:
+        return int(match.group(1))
+    return None
 
 
 def _extract_field_names(message: str) -> list[str]:

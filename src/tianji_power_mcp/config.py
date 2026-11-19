@@ -27,6 +27,14 @@ _SUB_NAMES = ("TJW_SUBSCRIPTION_ID", "real_sub_id", "TIANJI_SUBSCRIPTION_ID")
 # 进程级调用上限：额度有限，默认 20 次/进程，超了直接抛错而不是静默烧额度。
 DEFAULT_MAX_CALLS = int(os.environ.get("TJW_MAX_CALLS", "20"))
 
+# 起报发布滞后（小时）：00Z 约 17 时、12Z 约次日 05 时出，即起报后约 9 小时可用。
+# 只用于「估算最新起报」，真实取数后会拿响应里的 time_init 校正。
+DEFAULT_RUN_LAG_HOURS = float(os.environ.get("TJW_RUN_LAG_HOURS", "9"))
+# 取数时多要几小时余量，防止发布延迟导致窗口尾部缺数据；不够会自动补一次。
+DEFAULT_PAD_HOURS = int(os.environ.get("TJW_PAD_HOURS", "3"))
+# 单次最多取几天（订阅上限一般是 5/10/15/30/45 天，超了会返回 20009）。
+DEFAULT_MAX_FETCH_DAYS = int(os.environ.get("TJW_MAX_FETCH_DAYS", "10"))
+
 
 def _candidate_files() -> list[Path]:
     override = os.environ.get("TJW_CREDENTIAL_FILE")
@@ -71,6 +79,9 @@ class Settings:
     timeout: float = 30.0
     max_calls: int = DEFAULT_MAX_CALLS
     tz: int = 8
+    run_lag_hours: float = DEFAULT_RUN_LAG_HOURS
+    pad_hours: int = DEFAULT_PAD_HOURS
+    max_fetch_days: int = DEFAULT_MAX_FETCH_DAYS
 
     def masked(self) -> dict[str, str]:
         return {
@@ -98,4 +109,7 @@ def load_settings() -> Settings:
         subscription_id=sub,
         base_url=os.environ.get("TJW_BASE_URL", DEFAULT_BASE_URL),
         max_calls=int(os.environ.get("TJW_MAX_CALLS", str(DEFAULT_MAX_CALLS))),
+        run_lag_hours=float(os.environ.get("TJW_RUN_LAG_HOURS", str(DEFAULT_RUN_LAG_HOURS))),
+        pad_hours=int(os.environ.get("TJW_PAD_HOURS", str(DEFAULT_PAD_HOURS))),
+        max_fetch_days=int(os.environ.get("TJW_MAX_FETCH_DAYS", str(DEFAULT_MAX_FETCH_DAYS))),
     )

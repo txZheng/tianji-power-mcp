@@ -13,6 +13,7 @@ from mcp.server.mcpserver import MCPServer
 from . import __version__, derive, elements, hints, power, pv
 from .client import TianjiClient, TianjiError
 from .config import load_settings
+from .window import Window, parse_period, rolling_window
 
 SOURCE = "数据来源：中科天机气象 API"
 DISCLAIMER = "参考提示，非正式气象预报；不构成生产指令"
@@ -48,6 +49,33 @@ def _client() -> TianjiClient:
     if key not in _clients:
         _clients[key] = TianjiClient(settings)
     return _clients[key]
+
+
+def _window_for(period: str, hours: int) -> Window:
+    """把 period（人话时段）或 hours（从现在起算）解析成绝对窗口。"""
+    if period:
+        try:
+            window = parse_period(period)
+        except ValueError as exc:
+            raise TianjiError(str(exc)) from exc
+        if window is None:
+            raise TianjiError(
+                f"无法识别的时段：{period!r}。可用写法：未来24小时 / 未来7天 / 今天 / 明天下午 / "
+                "2026-12-01 / 2026-12-01~2026-12-03"
+            )
+        return window
+    return rolling_window(hours)
+
+
+def _require_rows(series, window: Window) -> dict | None:
+    """窗口里一行数据都没有时，别让下游把「空」误读成「没有事件」。"""
+    if series.rows:
+        return None
+    described = window.describe()
+    gap = series.coverage.describe()["note"] if series.coverage else ""
+    return _error(
+        TianjiError(f"窗口 {described['from']} ~ {described['to']} 内没有可取到的数据。{gap}".strip())
+    )
 
 
 def _envelope(payload: dict, series, extra: dict[str, Any] | None = None) -> dict:
@@ -92,43 +120,52 @@ def get_capability() -> dict:
 @server.tool(
     description=(
         "指定点位的电力气象提示：大风/覆冰/低温/高温/强降水/云遮挡，按事件合并并给出触发条件。"
-        "scenario 可选 wind（风电）/pv（光伏）/grid（电网）/general。"
+        "period 支持人话时段（未来24小时 / 今天 / 明天下午 / 2026-12-01~2026-12-03），"
+        "留空则从现在起 hours 小时；scenario 可选 wind（风电）/pv（光伏）/grid（电网）/general。"
     )
 )
 def power_weather_hint(
     location: str,
+    period: str = "",
     hours: int = 24,
-    start_hour: int = 0,
     scenario: str = "general",
     cut_out: float = 25.0,
 ) -> dict:
     scenario = scenario if scenario in DEFAULT_FIELDS else "general"
     try:
-        series = _client().dataset(location, hours=hours, start_hour=start_hour).project(
-            DEFAULT_FIELDS[scenario]
-        ).window(hours)
+        window = _window_for(period, hours)
+        series = _client().series_for_window(location, window).project(DEFAULT_FIELDS[scenario])
     except TianjiError as exc:
         return _error(exc)
+    empty = _require_rows(series, window)
+    if empty:
+        return empty
     result = hints.detect(series.rows, scenario=scenario, cut_out=cut_out)
     result["window"] = {
         "location": location,
-        "hours": hours,
-        "start_hour": start_hour,
+        **window.describe(),
         "first": series.rows[0]["time"] if series.rows else None,
         "last": series.rows[-1]["time"] if series.rows else None,
     }
     return _envelope(result, series)
 
 
-@server.tool(description="风电/光伏关心的关键要素逐时快照（含轮毂风速、露点、风力等级等派生量）。")
-def wind_solar_snapshot(location: str, hours: int = 24, start_hour: int = 0, t_res: str = "1h") -> dict:
+@server.tool(
+    description=(
+        "风电/光伏关心的关键要素逐时快照（含轮毂风速、露点、风力等级等派生量）。"
+        "period 支持人话时段，留空则从现在起 hours 小时。"
+    )
+)
+def wind_solar_snapshot(location: str, period: str = "", hours: int = 24, t_res: str = "1h") -> dict:
     fields = ["t2m", "rh2m", "ssrd", "ws10m", "ws100m", "wd100m", "cldt", "tp"]
     try:
-        series = _client().dataset(
-            location, hours=hours, start_hour=start_hour, t_res=t_res
-        ).project(fields).window(hours)
+        window = _window_for(period, hours)
+        series = _client().series_for_window(location, window, t_res).project(fields)
     except TianjiError as exc:
         return _error(exc)
+    empty = _require_rows(series, window)
+    if empty:
+        return empty
     rows = []
     for row in series.rows:
         rich = derive.enrich(row)
@@ -152,15 +189,16 @@ def wind_solar_snapshot(location: str, hours: int = 24, start_hour: int = 0, t_r
 
 @server.tool(
     description=(
-        "理论出力演示（非功率预测）。kind=wind 按功率曲线把风速映射为出力，"
+        "理论出力演示（非功率预测）。period 支持人话时段，留空则从现在起 hours 小时。"
+        "kind=wind 按功率曲线把风速映射为出力，"
         "切入/额定/切出、轮毂高度、容量、自定义 curve 均可指定；"
         "kind=pv 按辐照度×性能比×温度修正算光伏出力，pr/tilt_gain 可指定。"
     )
 )
 def theoretical_power(
     location: str,
+    period: str = "",
     hours: int = 24,
-    start_hour: int = 0,
     kind: str = "wind",
     hub_height: float = 100.0,
     cut_in: float = 3.0,
@@ -177,9 +215,8 @@ def theoretical_power(
     try:
         if kind == "wind":
             power.check_params(cut_in, rated, cut_out, hub_height, capacity_mw)
-            series = _client().dataset(location, hours=hours, start_hour=start_hour).project(
-                ["ws10m", "ws100m", "t2m"]
-            ).window(hours)
+            window = _window_for(period, hours)
+            series = _client().series_for_window(location, window).project(["ws10m", "ws100m", "t2m"])
             result = power.simulate(
                 series.rows,
                 hub_height=hub_height,
@@ -191,9 +228,8 @@ def theoretical_power(
             )
         else:
             pv.check_params(capacity_mw, pr, -0.004, tilt_gain)
-            series = _client().dataset(location, hours=hours, start_hour=start_hour).project(
-                ["ssrd", "t2m"]
-            ).window(hours)
+            window = _window_for(period, hours)
+            series = _client().series_for_window(location, window).project(["ssrd", "t2m"])
             result = pv.simulate(
                 series.rows,
                 capacity_mw=capacity_mw,
@@ -202,21 +238,25 @@ def theoretical_power(
             )
     except (ValueError, TianjiError) as exc:
         return _error(exc)
+    empty = _require_rows(series, window)
+    if empty:
+        return empty
     return _envelope(result, series)
 
 
 @server.tool(
     description=(
-        "唯一的取数入口：返回该窗口内全部已授权要素（服务端不支持筛选，故一次取全）。"
-        "其他加工类工具会复用同一份缓存，**不需要**先调用本工具。"
-        "fields 可选，用于投影列；limit>0 时只截断本次返回的行数，"
-        "不影响缓存与其他工具计算所用的完整数据。"
+        "唯一的取数入口：返回指定时段内全部已授权要素（服务端不支持筛选，故一次取全）。"
+        "period 支持人话时段（未来24小时 / 今天 / 明天 / 2026-12-01~2026-12-03），"
+        "留空则从现在起 hours 小时。其他加工类工具会复用同一份缓存，**不需要**先调用本工具。"
+        "fields 可选，用于投影列；limit>0 时只截断本次返回的行数。"
+        "响应里的 api.coverage 说明数据相对请求窗口的覆盖情况，complete=false 时请把缺失小时数转述给用户。"
     )
 )
 def get_dataset(
     location: str,
+    period: str = "",
     hours: int = 24,
-    start_hour: int = 0,
     t_res: str = "1h",
     fields: list[str] | None = None,
     limit: int = 0,
@@ -236,27 +276,31 @@ def get_dataset(
         codes = list(elements.ALL_FIELDS)
 
     try:
-        series = _client().query(location, codes, hours=hours, start_hour=start_hour, t_res=t_res)
+        window = _window_for(period, hours)
+        series = _client().series_for_window(location, window, t_res).project(codes)
     except TianjiError as exc:
         return _error(exc)
 
+    empty = _require_rows(series, window)
+    if empty:
+        return empty
     window_rows = len(series.rows)
-    # total_rows 指缓存里的完整数据集行数（窗口按整天向上取整），不是本次返回或本次窗口的行数
-    total = int(getattr(series, "dataset_rows", 0) or window_rows)
+    # total_rows 指这次取回的完整数据集行数（从起报锚定、含窗口外余量），不是本次返回的行数
+    total = int(series.dataset_rows or window_rows)
     cut = max(0, int(limit or 0))
     rows = series.rows[:cut] if cut > 0 else series.rows
     notes: list[str] = []
     if total > window_rows:
-        notes.append(
-            f"缓存完整数据集 {total} 行，本次窗口 {window_rows} 行，余量供同日其它提问复用"
-        )
+        notes.append(f"缓存完整数据集 {total} 行（自起报锚定），本次窗口 {window_rows} 行，余量供后续提问复用")
     if len(rows) < window_rows:
-        if total <= window_rows:
-            notes.append(f"完整数据集 {total} 行已缓存")
         notes.append(f"limit 只截断本次返回：已返回前 {len(rows)} 行，其它工具仍用完整数据")
+    coverage = series.coverage.describe() if series.coverage else None
+    if coverage and not coverage["complete"]:
+        notes.append(coverage["note"])
     note = "；".join(notes) + "。" if notes else ""
     return _envelope(
         {
+            "window": window.describe(),
             "rows": rows,
             "window_rows": window_rows,
             "total_rows": total,

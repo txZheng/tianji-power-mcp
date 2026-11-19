@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tianji_power_mcp import derive, elements, hints, power, pv
@@ -17,6 +18,15 @@ from tianji_power_mcp.client import (
     parse_location,
 )
 from tianji_power_mcp.config import Settings
+from tianji_power_mcp.window import (
+    CST,
+    Window,
+    calendar_window,
+    expected_run_init,
+    iso,
+    parse_period,
+    rolling_window,
+)
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample.json"
 SETTINGS = Settings(api_key="test-key", subscription_id="test-sub", max_calls=5)
@@ -198,7 +208,10 @@ class ClientOfflineTest(unittest.TestCase):
         import tempfile
 
         self._tmp = tempfile.mkdtemp(prefix="tianji-test-")
-        client = TianjiClient(SETTINGS, denied_store=Path(self._tmp) / "denied.json")
+        fixed_now = datetime(2026, 11, 18, 10, 0, tzinfo=CST)
+        client = TianjiClient(
+            SETTINGS, denied_store=Path(self._tmp) / "denied.json", now_fn=lambda: fixed_now
+        )
         queue = list(payloads)
 
         def fake_request(params):
@@ -222,7 +235,7 @@ class ClientOfflineTest(unittest.TestCase):
                 full[code] = row.get(code, 0.0)
             rows.append(full)
         units = {code: fx["units"].get(code, "") for code in elements.ALL_FIELDS}
-        return {"code": 200, "data": {"units": units, "data": rows}}
+        return {"code": 200, "data": {"units": units, "data": rows, "time_init": "2026-11-18T08:00+08:00"}}
 
     def test_one_request_serves_many_questions(self):
         client = self._client([self._payload()])
@@ -238,13 +251,11 @@ class ClientOfflineTest(unittest.TestCase):
         self.assertEqual(raw.fields, ["t2m"])
         self.assertEqual(len(raw.rows), 6)
 
-    def test_larger_window_refetches_but_smaller_reuses(self):
-        client = self._client([self._payload(), self._payload()])
-        client.query("112.55,37.87", ["t2m"], hours=6)   # 向上取整到 24h
-        client.query("112.55,37.87", ["t2m"], hours=12)  # 仍在 24h 桶内 → 复用
-        self.assertEqual(client.calls, 1)
-        client.query("112.55,37.87", ["t2m"], hours=48)  # 超出 → 重新取
-        self.assertEqual(client.calls, 2)
+    def test_same_window_reuses_cache(self):
+        client = self._client([self._payload()])
+        client.query("112.55,37.87", ["t2m"], hours=6)
+        client.query("112.55,37.87", ["t2m"], hours=6)
+        self.assertEqual(client.calls, 1, "同一窗口的第二次提问应命中缓存")
 
     def test_projection_does_not_mutate_cache(self):
         client = self._client([self._payload()])
@@ -317,203 +328,256 @@ class ServerRegistrationTest(unittest.TestCase):
         self.assertNotIn("get_raw_weather", names, "取数工具已更名为 get_dataset")
 
 
+
 class FakeClient:
-    """足够让 server 层跑起来的假客户端：不发网络请求，记录调用参数。"""
+    """server 层用的假客户端：按绝对窗口生成行，不发网络请求。"""
 
-    def __init__(self, rows: int = 10):
+    def __init__(self, capacity: int = 48):
         self.calls = 0
         self.seen: list[dict] = []
-        self._rows = rows
+        self.capacity = capacity
 
-    def _series(self, fields):
-        from tianji_power_mcp.client import Series
+    @staticmethod
+    def _row(moment):
+        row = {"time": iso(moment)}
+        for code in elements.ALL_FIELDS:
+            row[code] = 1.0
+        return row
 
-        rows = [
-            {"time": f"2026-11-19T{i:02d}:00+08:00", "t2m": float(i), "ws10m": 3.0}
-            for i in range(self._rows)
-        ]
+    def series_for_window(self, location, window, t_res="1h"):
+        from tianji_power_mcp.client import Coverage, Series
+
+        start = window.start.replace(minute=0, second=0, microsecond=0)
+        hours = max(0, int((window.end - start).total_seconds() // 3600))
+        rows = [self._row(start + timedelta(hours=i)) for i in range(hours)]
+        coverage = Coverage(
+            requested_from=iso(window.start),
+            requested_to=iso(window.end),
+            run_time_init="2026-11-18T20:00+08:00",
+            data_from=rows[0]["time"] if rows else None,
+            data_to=rows[-1]["time"] if rows else None,
+            complete=True,
+            fcst_days=2,
+        )
+        self.seen.append({"window": window.describe(), "t_res": t_res})
         return Series(
             rows=rows,
-            units={code: "u" for code in fields},
-            fields=list(fields),
-            time_init="2026-11-19T00:00+08:00",
-            calls=0,
+            units={code: "u" for code in elements.ALL_FIELDS},
+            fields=list(elements.ALL_FIELDS),
+            time_init="2026-11-18T20:00+08:00",
+            dataset_rows=self.capacity,
+            fcst_days=2,
+            coverage=coverage,
         )
 
-    def query(self, location, fields, hours=24, start_hour=0, t_res="1h"):
-        self.seen.append({"fields": list(fields), "hours": hours, "t_res": t_res})
-        return self._series(fields)
 
-    def dataset(self, location, hours=24, start_hour=0, t_res="1h"):
-        self.seen.append({"fields": list(elements.ALL_FIELDS), "hours": hours, "t_res": t_res})
-        return self._series(elements.ALL_FIELDS)
-
-
-class LimitSemanticsTest(unittest.TestCase):
-    """limit 只截断本次返回，不影响取数与其他工具使用的完整数据。"""
+class ToolWindowTest(unittest.TestCase):
+    """所有工具都按解析出的绝对窗口取数。"""
 
     def setUp(self):
         from tianji_power_mcp import server as srv
 
         self.srv = srv
-        self.fake = FakeClient(rows=10)
+        self.fake = FakeClient(capacity=48)
         self._original = srv._client
         srv._client = lambda: self.fake  # type: ignore[assignment]
 
     def tearDown(self):
         self.srv._client = self._original  # type: ignore[assignment]
 
-    def test_limit_truncates_only_the_return(self):
-        full = self.srv.get_dataset("112.55,37.87", hours=10)
-        cut = self.srv.get_dataset("112.55,37.87", hours=10, limit=3)
-
-        self.assertEqual(full["data"]["returned_rows"], 10)
-        self.assertFalse(full["data"]["truncated"])
-        self.assertEqual(cut["data"]["returned_rows"], 3)
-        self.assertEqual(cut["data"]["total_rows"], 10)
-        self.assertTrue(cut["data"]["truncated"])
-        self.assertIn("已缓存", cut["data"]["note"])
-
-    def test_limit_does_not_shrink_the_upstream_request(self):
-        self.srv.get_dataset("112.55,37.87", hours=10, limit=2)
-        self.assertEqual(self.fake.seen[-1]["hours"], 10, "limit 不应改变取数窗口")
-
-    def test_other_tools_still_use_full_rows(self):
-        self.srv.get_dataset("112.55,37.87", hours=10, limit=2)
-        snapshot = self.srv.wind_solar_snapshot("112.55,37.87", hours=10)
-        self.assertEqual(len(snapshot["data"]["rows"]), 10, "加工工具不应被 limit 影响")
-
-    def test_dataset_defaults_to_all_fields(self):
-        result = self.srv.get_dataset("112.55,37.87", hours=4)
-        self.assertEqual(self.fake.seen[-1]["fields"], elements.ALL_FIELDS)
-        self.assertTrue(result["ok"])
-
-
-class BucketedFakeClient:
-    """模拟真实客户端：缓存按整天取数，工具按请求窗口裁行。"""
-
-    def __init__(self, rows: int = 24):
-        self.calls = 0
-        self.seen: list[dict] = []
-        self._rows = rows
-
-    def _series(self, fields):
-        from tianji_power_mcp.client import Series
-
-        rows = [
-            {
-                "time": f"2026-11-19T{i:02d}:00+08:00",
-                "t2m": 5.0,
-                "rh2m": 60.0,
-                "ws10m": 3.0,
-                "ws100m": 5.0,
-                "wd100m": 180.0,
-                "tp": 0.0,
-                "pres": 90000.0,
-                "psz": 90000.0,
-                "cldt": 0.1,
-                "cldl": 0.0,
-                "cldh": 0.0,
-                "ssrd": 100.0,
-            }
-            for i in range(self._rows)
-        ]
-        return Series(
-            rows=rows,
-            units={code: "u" for code in fields},
-            fields=list(fields),
-            time_init="2026-11-19T00:00+08:00",
-            calls=0,
-            dataset_rows=self._rows,
-        )
-
-    def dataset(self, location, hours=24, start_hour=0, t_res="1h"):
-        self.seen.append({"fields": list(elements.ALL_FIELDS), "hours": hours, "t_res": t_res})
-        return self._series(elements.ALL_FIELDS)
-
-    def query(self, location, fields, hours=24, start_hour=0, t_res="1h"):
-        self.seen.append({"fields": list(fields), "hours": hours, "t_res": t_res})
-        return self._series(fields).window(hours)
-
-
-class WindowSemanticsTest(unittest.TestCase):
-    """缓存按整天取数，但每个工具只分析调用方请求的时段；total_rows 报缓存完整行数。"""
-
-    def setUp(self):
-        from tianji_power_mcp import server as srv
-
-        self.srv = srv
-        self.fake = BucketedFakeClient(rows=24)
-        self._original = srv._client
-        srv._client = lambda: self.fake  # type: ignore[assignment]
-
-    def tearDown(self):
-        self.srv._client = self._original  # type: ignore[assignment]
-
-    def test_get_dataset_separates_window_from_cache(self):
-        data = self.srv.get_dataset("112.55,37.87", hours=10)["data"]
-        self.assertEqual(data["returned_rows"], 10)
-        self.assertEqual(data["window_rows"], 10)
-        self.assertEqual(data["total_rows"], 24, "total_rows 应是缓存完整行数")
-        self.assertFalse(data["truncated"], "窗口 10 行本就不截断")
-        self.assertIn("24", data["note"])
-
-    def test_limit_truncates_only_the_return(self):
-        data = self.srv.get_dataset("112.55,37.87", hours=10, limit=3)["data"]
-        self.assertEqual(data["returned_rows"], 3)
-        self.assertEqual(data["window_rows"], 10)
-        self.assertEqual(data["total_rows"], 24)
-        self.assertTrue(data["truncated"])
-
-    def test_snapshot_honours_requested_hours(self):
-        rows = self.srv.wind_solar_snapshot("112.55,37.87", hours=6)["data"]["rows"]
-        self.assertEqual(len(rows), 6, "快照不应把整天数据都返回")
-
-    def test_hint_honours_requested_hours(self):
+    def test_hint_uses_requested_hours(self):
         result = self.srv.power_weather_hint("112.55,37.87", hours=6)
         self.assertTrue(result["ok"])
         self.assertEqual(result["data"]["window"]["hours"], 6)
-        self.assertEqual(result["data"]["window"]["last"], "2026-11-19T05:00+08:00")
+        self.assertEqual(len(self.fake.seen), 1)
 
-    def test_theoretical_power_honours_requested_hours(self):
+    def test_snapshot_uses_requested_hours(self):
+        rows = self.srv.wind_solar_snapshot("112.55,37.87", hours=6)["data"]["rows"]
+        self.assertEqual(len(rows), 6)
+
+    def test_theoretical_power_uses_requested_hours(self):
         result = self.srv.theoretical_power("112.55,37.87", hours=6, kind="wind")
-        self.assertTrue(result["ok"])
         self.assertEqual(result["data"]["summary"]["hours"], 6)
 
+    def test_period_tomorrow_is_a_calendar_window(self):
+        data = self.srv.get_dataset("112.55,37.87", period="明天")["data"]
+        self.assertEqual(data["window"]["kind"], "calendar")
+        self.assertEqual(data["window"]["hours"], 24)
+        self.assertTrue(data["window"]["from"].endswith("T00:00+08:00"))
+        self.assertEqual(data["window_rows"], 24)
 
-class ClientWindowTest(unittest.TestCase):
-    """真实客户端：一次取整天，投影与裁行都不发请求。"""
+    def test_period_range(self):
+        result = self.srv.power_weather_hint("112.55,37.87", period="2026-12-01~2026-12-03")
+        self.assertEqual(result["data"]["window"]["hours"], 72)
 
-    def test_query_slices_window_but_keeps_cache_total(self):
-        client = TianjiClient(SETTINGS)
+    def test_unknown_period_reports_error(self):
+        result = self.srv.get_dataset("112.55,37.87", period="随便说说")
+        self.assertFalse(result["ok"])
+        self.assertIn("无法识别的时段", result["error"])
 
-        def fake_request(params):
-            fields = str(params["fields"]).split(",")
-            rows = [
-                {"time": f"2026-11-19T{i:02d}:00+08:00", **{code: 1.0 for code in fields}}
-                for i in range(24)
-            ]
-            return {
-                "code": 200,
-                "data": {
-                    "time_init": "2026-11-19T00:00+08:00",
-                    "units": {code: "u" for code in fields},
-                    "data": rows,
-                },
-            }
+    def test_empty_window_is_an_error_not_an_empty_result(self):
+        from tianji_power_mcp.client import Coverage, Series
 
-        client._request = fake_request  # type: ignore[assignment]
+        empty = Series(
+            rows=[],
+            fields=list(elements.ALL_FIELDS),
+            coverage=Coverage(
+                requested_from="2026-11-18T00:00+08:00",
+                requested_to="2026-11-19T00:00+08:00",
+                complete=False,
+                missing_head_hours=24,
+            ),
+        )
+        self.fake.series_for_window = lambda *a, **k: empty  # type: ignore[assignment]
+        result = self.srv.get_dataset("112.55,37.87", period="昨天")
+        self.assertFalse(result["ok"])
+        self.assertIn("没有可取到的数据", result["error"])
 
-        with tempfile.TemporaryDirectory() as tmp:
-            client.denied_store = Path(tmp) / "denied.json"
-            full = client.dataset("112.55,37.87", hours=10)
-            self.assertEqual(len(full.rows), 24, "缓存按整天取数")
-            self.assertEqual(full.dataset_rows, 24)
 
-            window = client.query("112.55,37.87", ["t2m", "ws10m"], hours=10)
-            self.assertEqual(len(window.rows), 10, "投影结果要按请求窗口裁行")
-            self.assertEqual(window.dataset_rows, 24)
-            self.assertEqual(client.calls, 1, "窗口裁剪不应产生额外请求")
+class DatasetSemanticsTest(unittest.TestCase):
+    """total_rows 是这次取回的完整行数，window_rows 才是窗口行数。"""
+
+    def setUp(self):
+        from tianji_power_mcp import server as srv
+
+        self.srv = srv
+        self.fake = FakeClient(capacity=48)
+        self._original = srv._client
+        srv._client = lambda: self.fake  # type: ignore[assignment]
+
+    def tearDown(self):
+        self.srv._client = self._original  # type: ignore[assignment]
+
+    def test_separates_window_from_cache(self):
+        data = self.srv.get_dataset("112.55,37.87", hours=10)["data"]
+        self.assertEqual(data["window_rows"], 10)
+        self.assertEqual(data["total_rows"], 48)
+        self.assertFalse(data["truncated"])
+
+    def test_limit_only_truncates_return(self):
+        data = self.srv.get_dataset("112.55,37.87", hours=10, limit=3)["data"]
+        self.assertEqual(data["returned_rows"], 3)
+        self.assertEqual(data["window_rows"], 10)
+        self.assertTrue(data["truncated"])
+        self.assertIn("limit", data["note"])
+
+
+class WindowParseTest(unittest.TestCase):
+    NOW = datetime(2026, 11, 19, 14, 56, tzinfo=CST)
+
+    def test_rolling_hours(self):
+        window = parse_period("未来24小时", self.NOW)
+        self.assertEqual((window.start, window.end), (self.NOW, self.NOW + timedelta(hours=24)))
+
+    def test_rolling_days(self):
+        window = parse_period("未来7天", self.NOW)
+        self.assertEqual(window.hours, 168)
+        self.assertEqual(window.kind, "rolling")
+
+    def test_today_and_tomorrow(self):
+        self.assertEqual(iso(parse_period("今天", self.NOW).start), "2026-11-19T00:00+08:00")
+        tomorrow = parse_period("明天", self.NOW)
+        self.assertEqual(iso(tomorrow.start), "2026-11-20T00:00+08:00")
+        self.assertEqual(tomorrow.hours, 24)
+
+    def test_day_part(self):
+        window = parse_period("明天下午", self.NOW)
+        self.assertEqual((window.start.hour, window.end.hour), (12, 18))
+
+    def test_explicit_dates(self):
+        window = parse_period("2026-12-01~2026-12-03", self.NOW)
+        self.assertEqual(window.hours, 72)
+        self.assertEqual(iso(window.end), "2026-12-04T00:00+08:00")
+
+    def test_unknown_returns_none(self):
+        self.assertIsNone(parse_period("随便说说", self.NOW))
+
+    def test_reversed_range_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_period("2026-12-05~2026-12-01", self.NOW)
+
+    def test_run_init_switches_at_05_and_17(self):
+        def init(hour, minute=0):
+            return expected_run_init(datetime(2026, 11, 19, hour, minute, tzinfo=CST), 9)
+
+        self.assertEqual(iso(init(4, 59)), "2026-11-18T08:00+08:00")
+        self.assertEqual(iso(init(5, 1)), "2026-11-18T20:00+08:00")
+        self.assertEqual(iso(init(16, 59)), "2026-11-18T20:00+08:00")
+        self.assertEqual(iso(init(17, 1)), "2026-11-19T08:00+08:00")
+
+
+class StubAPI:
+    """模拟天机接口：数据从 init+1h 开始，共 fcst_days*24 小时。"""
+
+    def __init__(self, init, first_cap=None):
+        self.init = init
+        self.first_cap = first_cap
+        self.requests: list[int] = []
+
+    def __call__(self, params):
+        days = int(params["fcst_days"])
+        self.requests.append(days)
+        hours = days * 24
+        if self.first_cap is not None and len(self.requests) == 1:
+            hours = min(hours, self.first_cap)
+        fields = str(params["fields"]).split(",")
+        rows = [
+            {"time": iso(self.init + timedelta(hours=i + 1)), **{code: 1.0 for code in fields}}
+            for i in range(hours)
+        ]
+        return {
+            "code": 200,
+            "data": {
+                "time_init": iso(self.init),
+                "units": {code: "u" for code in fields},
+                "data": rows,
+            },
+        }
+
+
+class AnchoredFetchTest(unittest.TestCase):
+    """起报锚定 + 余量取数 + 裁剪 + 覆盖校验。"""
+
+    NOW = datetime(2026, 11, 19, 15, 0, tzinfo=CST)
+
+    def _client(self, api):
+        client = TianjiClient(SETTINGS, now_fn=lambda: self.NOW)
+        client._request = api  # type: ignore[method-assign]
+        return client
+
+    def test_window_is_trimmed_to_requested_range(self):
+        api = StubAPI(datetime(2026, 11, 18, 20, 0, tzinfo=CST))
+        client = self._client(api)
+        series = client.series_for_window("112.55,37.87", rolling_window(12, self.NOW))
+
+        self.assertEqual(len(series.rows), 12)
+        self.assertEqual(series.rows[0]["time"], iso(self.NOW))
+        self.assertTrue(series.coverage.complete)
+        self.assertEqual(api.requests, [2], "起报比请求时刻早，必须多要一天余量")
+
+    def test_tail_gap_triggers_one_more_fetch(self):
+        api = StubAPI(datetime(2026, 11, 18, 20, 0, tzinfo=CST), first_cap=24)
+        client = self._client(api)
+        series = client.series_for_window("112.55,37.87", rolling_window(30, self.NOW))
+
+        self.assertEqual(len(api.requests), 2)
+        self.assertTrue(series.retried)
+        self.assertTrue(series.coverage.complete)
+
+    def test_head_gap_is_reported_not_padded(self):
+        api = StubAPI(datetime(2026, 11, 19, 8, 0, tzinfo=CST))
+        client = self._client(api)
+        window = Window(
+            datetime(2026, 11, 19, 6, 0, tzinfo=CST),
+            datetime(2026, 11, 19, 12, 0, tzinfo=CST),
+            "测试窗口",
+        )
+        series = client.series_for_window("112.55,37.87", window)
+
+        coverage = series.coverage
+        self.assertFalse(coverage.complete)
+        self.assertEqual(coverage.missing_head_hours, 3)
+        self.assertEqual(len(series.rows), 3)
 
 
 if __name__ == "__main__":
