@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Tianji power weather advisories",
+    "description": "Connects the local Tianji power weather MCP server, which turns Tianji forecast fields into wind, icing, cold, heat, heavy-rain and cloud advisories for power assets, plus a theoretical output demo.",
+    "detail": "docs/DETAIL.md"
+  }
+}

@@ -1,0 +1,13 @@
+- insert:
+    - id: tianji-power-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: power
+        transport: stdio
+        # 安装前把 <REPO_DIR> 替换为本仓库的绝对路径
+        command: <REPO_DIR>/.venv/bin/python
+        args:
+          - -m
+          - tianji_power_mcp.server
+        cwd: <REPO_DIR>
+        failOnStartupError: true

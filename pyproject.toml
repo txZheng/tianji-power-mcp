@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tianji-power-mcp"
+version = "0.1.0"
+description = "天机气象 · 电力行业天气提示 MCP（大风/覆冰/低温/高温/强降水/云遮挡 + 理论出力演示）"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "TIANJI Weather" }]
+requires-python = ">=3.10"
+dependencies = ["mcp>=2.0"]
+keywords = ["mcp", "model-context-protocol", "weather", "power", "wind", "solar", "forecast"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: Atmospheric Science",
+]
+
+[project.urls]
+Homepage = "https://www.tjweather.com"
+
+[project.scripts]
+tianji-power-mcp = "tianji_power_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+tianji_power_mcp = ["py.typed"]
