@@ -121,6 +121,50 @@ python scripts/smoke_stdio.py
 | `args` | pip 安装留空；源码安装为 `["-m", "tianji_power_mcp.server"]` |
 | `env` | `TJW_API_KEY`、`TJW_SUBSCRIPTION_ID`（若不用 `.env`） |
 
+### 让 agent 自己接入（推荐）
+
+不想手改配置的话，把下面这段整段发给你正在用的 agent（DeepSeek Harness、WorkBuddy、Cursor 等），它会自己完成下载、安装、注册和自检。
+
+```text
+请帮我接入「天机气象 · 电力提示」MCP 服务，按下面步骤做，每步做完简短回报：
+
+1. 安装
+   git clone <REPO_URL> ~/mcp/tianji-power-mcp
+   cd ~/mcp/tianji-power-mcp && python3 -m venv .venv && .venv/bin/pip install -e .
+
+2. 凭据：向我索取 API key 和订阅 ID（不要自己编，也不要写进任何会进 git 的文件），
+   写入 ~/mcp/tianji-power-mcp/.env：
+     TJW_API_KEY=...
+     TJW_SUBSCRIPTION_ID=...
+
+3. 按你所在宿主注册这个 stdio 服务，服务名用 tianji-power：
+   - DeepSeek Harness：用仓库里的 dsh-bundles/tianji-power，把其中 <REPO_DIR> 换成
+     ~/mcp/tianji-power-mcp 后装进 profile
+   - WorkBuddy：写进 ~/.workbuddy/mcp.json 的 mcpServers
+   - Claude Desktop / Cursor：写进各自的 mcpServers 配置
+   启动参数统一为：
+     command = ~/mcp/tianji-power-mcp/.venv/bin/python
+     args    = ["-m", "tianji_power_mcp.server"]
+     cwd     = ~/mcp/tianji-power-mcp
+
+4. 自检（不消耗 API 额度）
+   cd ~/mcp/tianji-power-mcp && .venv/bin/python scripts/smoke_stdio.py
+   应列出 5 个工具，其中包含 get_dataset。
+
+5. 回报：安装路径、服务名、工具列表、以及 get_capability 返回的已授权要素数量。
+   注意：不要为了验证去跑 scripts/smoke_live.py，它会消耗 API 调用额度。
+```
+
+只需要装好、凭据你自己后面再填的话，一句话就够：
+
+```text
+帮我接入天机电力气象 MCP：git clone <REPO_URL> ~/mcp/tianji-power-mcp 并
+`pip install -e .`，然后按你当前宿主的 MCP 配置注册 stdio 服务
+（command 用 .venv/bin/python，args 用 -m tianji_power_mcp.server），凭据我稍后提供。
+```
+
+agent 执行过程中可能会请你确认路径、Key、以及是否写入宿主配置——这些是正常的安全确认，确认后它会自己跑完自检。
+
 ### DeepSeek Harness
 
 仓库里的 [`dsh-bundles/tianji-power`](dsh-bundles/tianji-power) 是一个可直接安装的 bundle（配置型，不含 JS 代码）。安装后由 `dsh-mcp-client` 按补丁里的配置拉起服务：
