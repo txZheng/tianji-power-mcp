@@ -76,7 +76,13 @@ uvx --from "git+https://github.com/<org>/tianji-power-mcp.git" tianji-power-mcp
 
 ## 配置凭据
 
-优先读环境变量，其次读工作区 `.env`（`.env` 已被 git 忽略，不会误提交）：
+还没有 API 凭据的话，先到天机气象官网申请：
+
+- [API-KEY 申请与权益查询](https://www.tjweather.com/info/doc/video/tutorial1.html) —— 注册、申请 API-KEY、查看订阅权益
+- [天机 API 概览](https://www.tjweather.com/info/doc/download/api/readme.html) —— 端点、错误码、调用频率
+- [JSON 格式 API 文档](https://www.tjweather.com/info/doc/download/api/weather/json.html) —— 要素码表与参数说明
+
+拿到 key 之后，凭据优先读环境变量，其次读工作区 `.env`（`.env` 已被 git 忽略，不会误提交）：
 
 ```bash
 cp .env.example .env
