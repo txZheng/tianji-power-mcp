@@ -8,7 +8,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from tianji_power_mcp import derive, elements, hints, power, pv
+from tianji_power_mcp import daily, derive, elements, hints, power, pv
 from tianji_power_mcp.client import (
     BudgetExhausted,
     FieldDenied,
@@ -210,7 +210,10 @@ class ClientOfflineTest(unittest.TestCase):
         self._tmp = tempfile.mkdtemp(prefix="tianji-test-")
         fixed_now = datetime(2026, 11, 18, 10, 0, tzinfo=CST)
         client = TianjiClient(
-            SETTINGS, denied_store=Path(self._tmp) / "denied.json", now_fn=lambda: fixed_now
+            SETTINGS,
+            denied_store=Path(self._tmp) / "denied.json",
+            usage_store=Path(self._tmp) / "usage.jsonl",
+            now_fn=lambda: fixed_now,
         )
         queue = list(payloads)
 
@@ -322,7 +325,14 @@ class ServerRegistrationTest(unittest.TestCase):
         tools = asyncio.run(srv.server.list_tools())
         names = {tool.name for tool in tools}
         self.assertLessEqual(
-            {"get_capability", "power_weather_hint", "wind_solar_snapshot", "theoretical_power", "get_dataset"},
+            {
+                "get_capability",
+                "power_weather_hint",
+                "wind_solar_snapshot",
+                "theoretical_power",
+                "daily_summary",
+                "get_dataset",
+            },
             names,
         )
         self.assertNotIn("get_raw_weather", names, "取数工具已更名为 get_dataset")
@@ -555,7 +565,13 @@ class AnchoredFetchTest(unittest.TestCase):
     NOW = datetime(2026, 11, 19, 15, 0, tzinfo=CST)
 
     def _client(self, api):
-        client = TianjiClient(SETTINGS, now_fn=lambda: self.NOW)
+        tmp = Path(tempfile.mkdtemp(prefix="tianji-anchored-"))
+        client = TianjiClient(
+            SETTINGS,
+            now_fn=lambda: self.NOW,
+            denied_store=tmp / "denied.json",
+            usage_store=tmp / "usage.jsonl",
+        )
         client._request = api  # type: ignore[method-assign]
         return client
 
@@ -592,6 +608,174 @@ class AnchoredFetchTest(unittest.TestCase):
         self.assertFalse(coverage.complete)
         self.assertEqual(coverage.missing_head_hours, 3)
         self.assertEqual(len(series.rows), 3)
+
+
+class DailySummaryTest(unittest.TestCase):
+    """逐日聚合的口径：降水求和、半天标注、理论电量逐时累计。"""
+
+    @staticmethod
+    def _rows(start: datetime, hours: int, **values):
+        rows = []
+        for i in range(hours):
+            row = {"time": iso(start + timedelta(hours=i))}
+            for code in ("t2m", "rh2m", "ws10m", "ws100m", "cldt", "tp", "ssrd"):
+                row[code] = float(values.get(code, 0.0))
+            rows.append(row)
+        return rows
+
+    def test_partial_days_are_labeled(self):
+        rows = self._rows(datetime(2026, 11, 19, 16, 0, tzinfo=CST), 80)  # 19日16时 → 22日24时
+        out = daily.daily_summary(rows, kind="general")
+        self.assertEqual(len(out["days"]), 4)
+        first = out["days"][0]
+        self.assertEqual((first["date"], first["hours"], first["span"]), ("2026-11-19", 8, "16–24时"))
+        self.assertEqual(out["days"][1]["span"], "全天")
+        self.assertEqual(out["days"][1]["hours"], 24)
+        self.assertEqual(out["totals"]["hours"], 80)
+
+    def test_tp_is_summed_not_maxed(self):
+        rows = self._rows(datetime(2026, 11, 20, 0, 0, tzinfo=CST), 24, tp=1.5)
+        out = daily.daily_summary(rows)
+        day = out["days"][0]
+        self.assertEqual(day["tp_sum_mm"], 36.0, "24 小时 × 1.5 mm/hr = 36 mm，不是最大值 1.5")
+        self.assertEqual(day["rain_hours"], 24)
+        self.assertEqual(out["totals"]["tp_sum_mm"], 36.0)
+
+    def test_ssrd_daylight_mean_excludes_night(self):
+        rows = self._rows(datetime(2026, 11, 20, 0, 0, tzinfo=CST), 24)
+        for row in rows:
+            hour = datetime.fromisoformat(row["time"]).hour
+            row["ssrd"] = 600.0 if 8 <= hour <= 17 else 0.0
+        out = daily.daily_summary(rows)
+        self.assertEqual(out["days"][0]["daylight_hours"], 10)
+        self.assertEqual(out["days"][0]["ssrd"]["max"], 600)
+        self.assertEqual(out["days"][0]["ssrd"]["daylight_mean"], 600)
+
+    def test_wind_zero_hours_when_below_cut_in(self):
+        rows = self._rows(datetime(2026, 11, 20, 0, 0, tzinfo=CST), 24, ws100m=2.0)
+        out = daily.daily_summary(rows, kind="wind")
+        wind = out["days"][0]["wind"]
+        self.assertEqual(wind["zero_output_hours"], 24)
+        self.assertEqual(wind["energy_mwh"], 0.0)
+        self.assertEqual(out["totals"]["wind"]["energy_mwh"], 0.0)
+
+    def test_wind_energy_at_rated(self):
+        rows = self._rows(datetime(2026, 11, 20, 0, 0, tzinfo=CST), 24, ws100m=12.0)
+        out = daily.daily_summary(rows, kind="wind", capacity_mw=5.0)
+        self.assertEqual(out["days"][0]["wind"]["energy_mwh"], 120.0, "额定 5MW × 24h")
+        self.assertAlmostEqual(out["days"][0]["wind"]["capacity_factor"], 1.0, places=3)
+
+    def test_pv_energy_matches_hourly_simulation(self):
+        rows = self._rows(datetime(2026, 11, 20, 0, 0, tzinfo=CST), 24, t2m=25.0)
+        for row in rows:
+            hour = datetime.fromisoformat(row["time"]).hour
+            row["ssrd"] = 1000.0 if 10 <= hour <= 15 else 0.0
+        out = daily.daily_summary(rows, kind="pv", capacity_mw=5.0)
+        sim = pv.simulate(rows, capacity_mw=5.0)
+        self.assertAlmostEqual(out["totals"]["pv"]["energy_mwh"], sim["summary"]["energy_mwh"], places=1)
+        self.assertEqual(out["days"][0]["pv"]["daylight_hours"], sim["summary"]["daylight_hours"])
+
+    def test_kind_general_has_no_power_columns(self):
+        rows = self._rows(datetime(2026, 11, 20, 0, 0, tzinfo=CST), 24)
+        out = daily.daily_summary(rows, kind="general")
+        self.assertNotIn("wind", out["days"][0])
+        self.assertNotIn("pv", out["days"][0])
+        self.assertNotIn("wind", out["totals"])
+
+    def test_missing_field_gives_none(self):
+        rows = self._rows(datetime(2026, 11, 20, 0, 0, tzinfo=CST), 24)
+        for row in rows:
+            row.pop("rh2m")
+        out = daily.daily_summary(rows)
+        self.assertIsNone(out["days"][0]["rh2m"])
+
+    def test_invalid_kind_rejected(self):
+        with self.assertRaises(ValueError):
+            daily.daily_summary([], kind="storm")
+
+
+class DailyToolTest(unittest.TestCase):
+    """server 层：daily_summary 按解析窗口取数并聚合成日表。"""
+
+    def setUp(self):
+        from tianji_power_mcp import server as srv
+
+        self.srv = srv
+        self.fake = FakeClient(capacity=48)
+        self._original = srv._client
+        srv._client = lambda: self.fake  # type: ignore[assignment]
+
+    def tearDown(self):
+        self.srv._client = self._original  # type: ignore[assignment]
+
+    def test_calendar_period_is_one_full_day(self):
+        result = self.srv.daily_summary("112.55,37.87", period="明天", kind="both")
+        self.assertTrue(result["ok"])
+        data = result["data"]
+        self.assertEqual(len(data["days"]), 1)
+        self.assertEqual(data["days"][0]["span"], "全天")
+        self.assertEqual(data["days"][0]["hours"], 24)
+        self.assertIn("wind", data["days"][0])
+        self.assertIn("pv", data["days"][0])
+        self.assertEqual(data["window"]["kind"], "calendar")
+
+    def test_rolling_hours_split_into_days(self):
+        result = self.srv.daily_summary("112.55,37.87", hours=30)
+        self.assertTrue(result["ok"])
+        days = result["data"]["days"]
+        self.assertTrue(2 <= len(days) <= 3, "30 小时至少跨两个自然日")
+        self.assertEqual(sum(day["hours"] for day in days), 30)
+        self.assertEqual(result["data"]["totals"]["hours"], 30)
+
+    def test_rejects_bad_kind(self):
+        result = self.srv.daily_summary("112.55,37.87", hours=24, kind="storm")
+        self.assertFalse(result["ok"])
+        self.assertIn("kind", result["error"])
+
+    def test_rejects_bad_power_params(self):
+        result = self.srv.daily_summary("112.55,37.87", hours=24, kind="wind", cut_in=12.0)
+        self.assertFalse(result["ok"])
+
+
+class UsageLedgerTest(unittest.TestCase):
+    """额度台账：真实请求逐次落盘，缓存命中不记账。"""
+
+    NOW = datetime(2026, 11, 19, 15, 0, tzinfo=CST)
+
+    def _client(self, api):
+        tmp = Path(tempfile.mkdtemp(prefix="tianji-usage-"))
+        client = TianjiClient(
+            SETTINGS,
+            now_fn=lambda: self.NOW,
+            denied_store=tmp / "denied.json",
+            usage_store=tmp / "usage.jsonl",
+        )
+        client._request = api  # type: ignore[method-assign]
+        return client
+
+    def test_each_real_request_is_logged_once(self):
+        client = self._client(StubAPI(datetime(2026, 11, 18, 20, 0, tzinfo=CST)))
+        client.series_for_window("112.55,37.87", rolling_window(12, self.NOW))
+        client.series_for_window("112.55,37.87", rolling_window(12, self.NOW))  # 命中缓存
+        summary = client.usage_summary()
+        self.assertEqual(summary["total_calls"], 1)
+        self.assertEqual(summary["today_calls"], 1)
+        self.assertEqual(summary["today_ok"], 1)
+
+    def test_retry_fetch_is_logged_too(self):
+        api = StubAPI(datetime(2026, 11, 18, 20, 0, tzinfo=CST), first_cap=24)
+        client = self._client(api)
+        client.series_for_window("112.55,37.87", rolling_window(30, self.NOW))  # 触发一次补取
+        summary = client.usage_summary()
+        self.assertEqual(summary["total_calls"], 2, "首取 + 补取各记一笔")
+        self.assertEqual(summary["today_calls"], 2)
+
+    def test_capability_reports_usage(self):
+        client = self._client(StubAPI(datetime(2026, 11, 18, 20, 0, tzinfo=CST)))
+        client.series_for_window("112.55,37.87", rolling_window(12, self.NOW))
+        cap = client.capability()
+        self.assertIn("usage", cap)
+        self.assertEqual(cap["usage"]["today_calls"], 1)
 
 
 if __name__ == "__main__":

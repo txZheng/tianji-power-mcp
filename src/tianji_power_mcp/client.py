@@ -32,6 +32,8 @@ from .window import Window, expected_run_init, iso, now_cst, rolling_window
 
 CACHE_TTL_SECONDS = 600.0
 DENIED_STORE = PROJECT_ROOT / ".runtime" / "denied.json"
+# 额度台账：每次真实请求（含失败尝试）追加一行，get_capability 可查累计/今日用量
+USAGE_STORE = PROJECT_ROOT / ".runtime" / "usage.jsonl"
 
 MAX_HOURS = 240
 MAX_START_HOUR = 72
@@ -221,12 +223,19 @@ def _row_time(row: dict) -> datetime | None:
 
 
 class TianjiClient:
-    def __init__(self, settings: Settings | None = None, denied_store: Path | None = None, now_fn=None):
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        denied_store: Path | None = None,
+        usage_store: Path | None = None,
+        now_fn=None,
+    ):
         self.settings = settings or load_settings()
         self._now = now_fn or now_cst
         self.calls = 0
         self._cache: dict[tuple[str, str], tuple[float, Series]] = {}
         self.denied_store = Path(denied_store) if denied_store else DENIED_STORE
+        self.usage_store = Path(usage_store) if usage_store else USAGE_STORE
         self.dynamic_denied: dict[str, str] = self._load_denied()
 
     # ---------- 额度与黑名单 ----------
@@ -247,6 +256,53 @@ class TianjiClient:
             )
         except OSError:
             pass  # 落盘失败不影响主流程
+
+    # ---------- 额度台账 ----------
+
+    def _log_usage(self, loc: str, days: int, t_res: str, outcome: str) -> None:
+        """每次真实请求（含失败尝试）追加一行 JSONL；落盘失败不影响主流程。"""
+        try:
+            self.usage_store.parent.mkdir(parents=True, exist_ok=True)
+            entry = {
+                "ts": iso(self._now()),
+                "loc": loc,
+                "days": int(days),
+                "t_res": t_res,
+                "outcome": outcome,
+            }
+            with self.usage_store.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+    def usage_summary(self) -> dict:
+        """本地台账口径：累计与今日的真实请求次数（含失败尝试）。"""
+        total = today = today_ok = 0
+        today_key = iso(self._now())[:10]
+        if self.usage_store.is_file():
+            try:
+                for line in self.usage_store.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    total += 1
+                    if str(entry.get("ts", "")).startswith(today_key):
+                        today += 1
+                        if entry.get("outcome") == "ok":
+                            today_ok += 1
+            except OSError:
+                pass
+        return {
+            "file": str(self.usage_store),
+            "total_calls": total,
+            "today_calls": today,
+            "today_ok": today_ok,
+            "note": "本地台账：统计真实发出的请求（含失败尝试），与 API 侧计费口径可能略有差异",
+        }
 
     def _spend(self) -> None:
         if self.calls >= self.settings.max_calls:
@@ -328,6 +384,7 @@ class TianjiClient:
             try:
                 payload = self._request(params)
             except FieldDenied as exc:
+                self._log_usage(f"{lon},{lat}", days, t_res, "denied_fields")
                 removed = [name for name in exc.fields if name in attempt]
                 rest = [name for name in attempt if name not in exc.fields]
                 if not removed or not rest:
@@ -339,6 +396,7 @@ class TianjiClient:
                 fetch(rest)
                 return
             except TianjiError as exc:
+                self._log_usage(f"{lon},{lat}", days, t_res, f"failed:{type(exc).__name__}")
                 # 要素数量超限（20011）：二分重试，调用方无感
                 if "20011" in str(exc) and len(attempt) > 1:
                     mid = len(attempt) // 2
@@ -346,6 +404,7 @@ class TianjiClient:
                     fetch(attempt[mid:])
                     return
                 raise
+            self._log_usage(f"{lon},{lat}", days, t_res, "ok")
 
             data = payload.get("data") or {}
             time_init = time_init or data.get("time_init")
@@ -515,6 +574,7 @@ class TianjiClient:
                 "一次请求取齐全部已授权要素并缓存；风电/光伏/理论出力/原始取数都从同一份"
                 "缓存按需投影，同一坐标与窗口的后续提问不再产生请求。"
             ),
+            "usage": self.usage_summary(),
             "endpoint": self.settings.masked(),
         }
 

@@ -10,7 +10,7 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from . import __version__, derive, elements, hints, power, pv
+from . import __version__, daily, derive, elements, hints, power, pv
 from .client import TianjiClient, TianjiError
 from .config import load_settings
 from .window import Window, parse_period, rolling_window
@@ -241,6 +241,72 @@ def theoretical_power(
     empty = _require_rows(series, window)
     if empty:
         return empty
+    return _envelope(result, series)
+
+
+@server.tool(
+    description=(
+        "逐日汇总：把窗口按自然日聚合成日表（温度/湿度/风速/辐照/云量/降水），"
+        "首/末日不足整天时 span 会标注实际时段；降水是小时率，日量按逐时求和。"
+        "kind=general 仅气象；kind=wind / pv / both 附加逐日理论电量、容量因子与零出力小时"
+        "（演示模型，非功率预测，参数口径同 theoretical_power）。"
+        "period 支持人话时段（未来3天 / 明天 / 2026-12-01~2026-12-03），留空则从现在起 hours 小时。"
+        "复用同一份缓存，同坐标的后续提问不额外消耗额度。"
+    )
+)
+def daily_summary(
+    location: str,
+    period: str = "",
+    hours: int = 24,
+    kind: str = "general",
+    hub_height: float = 100.0,
+    cut_in: float = 3.0,
+    rated: float = 12.0,
+    cut_out: float = 25.0,
+    capacity_mw: float = 5.0,
+    curve: list[list[float]] | None = None,
+    pr: float = 0.82,
+    tilt_gain: float = 1.0,
+    t_res: str = "1h",
+) -> dict:
+    kind = (kind or "general").strip().lower()
+    if kind not in ("general", "wind", "pv", "both"):
+        return _error(ValueError(f"kind 只能是 general / wind / pv / both，收到 {kind!r}"))
+    want_wind = kind in ("wind", "both")
+    want_pv = kind in ("pv", "both")
+    try:
+        if want_wind:
+            power.check_params(cut_in, rated, cut_out, hub_height, capacity_mw)
+        if want_pv:
+            pv.check_params(capacity_mw, pr, -0.004, tilt_gain)
+        window = _window_for(period, hours)
+        fields = ["t2m", "rh2m", "ws10m", "ws100m", "cldt", "tp", "pres", "ssrd"]
+        series = _client().series_for_window(location, window, t_res).project(fields)
+    except (ValueError, TianjiError) as exc:
+        return _error(exc)
+    empty = _require_rows(series, window)
+    if empty:
+        return empty
+    step_hours = 0.25 if str(t_res).strip().lower() == "15min" else 1.0
+    result = daily.daily_summary(
+        series.rows,
+        kind=kind,
+        step_hours=step_hours,
+        hub_height=hub_height,
+        cut_in=cut_in,
+        rated=rated,
+        cut_out=cut_out,
+        capacity_mw=capacity_mw,
+        curve=curve,
+        pr=pr,
+        tilt_gain=tilt_gain,
+    )
+    result["window"] = {
+        "location": location,
+        **window.describe(),
+        "first": series.rows[0]["time"] if series.rows else None,
+        "last": series.rows[-1]["time"] if series.rows else None,
+    }
     return _envelope(result, series)
 
 
