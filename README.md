@@ -37,7 +37,7 @@
 ### 方式一：下载压缩包（不想装 git 的用户）
 
 ```bash
-curl -LO https://github.com/<org>/tianji-power-mcp/archive/refs/heads/main.zip
+curl -LO https://github.com/txZheng/tianji-power-mcp/archive/refs/heads/main.zip
 unzip main.zip && cd tianji-power-mcp-main
 python3 -m venv .venv
 .venv/bin/pip install -e .
@@ -48,7 +48,7 @@ python3 -m venv .venv
 ### 方式二：git clone
 
 ```bash
-git clone https://github.com/<org>/tianji-power-mcp.git
+git clone https://github.com/txZheng/tianji-power-mcp.git
 cd tianji-power-mcp
 python3 -m venv .venv
 .venv/bin/pip install -e .
@@ -57,7 +57,7 @@ python3 -m venv .venv
 ### 方式三：pip 直接安装（不用克隆）
 
 ```bash
-pip install "git+https://github.com/<org>/tianji-power-mcp.git"
+pip install "git+https://github.com/txZheng/tianji-power-mcp.git"
 ```
 
 装完会得到 `tianji-power-mcp` 命令，可以直接作为宿主的启动命令：
@@ -69,7 +69,7 @@ tianji-power-mcp
 用 [uv](https://docs.astral.sh/uv/) 的话可以更省事，连虚拟环境都不用建：
 
 ```bash
-uvx --from "git+https://github.com/<org>/tianji-power-mcp.git" tianji-power-mcp
+uvx --from "git+https://github.com/txZheng/tianji-power-mcp.git" tianji-power-mcp
 ```
 
 > 方式三没有项目目录，因此**无法读取 `.env`**，凭据要通过宿主的环境变量注入（见下文各宿主配置里的 `env` 字段）。
@@ -129,7 +129,7 @@ python scripts/smoke_stdio.py
 请帮我接入「天机气象 · 电力提示」MCP 服务，按下面步骤做，每步做完简短回报：
 
 1. 安装
-   git clone <REPO_URL> ~/mcp/tianji-power-mcp
+   git clone https://github.com/txZheng/tianji-power-mcp ~/mcp/tianji-power-mcp
    cd ~/mcp/tianji-power-mcp && python3 -m venv .venv && .venv/bin/pip install -e .
 
 2. 凭据：向我索取 API key 和订阅 ID（不要自己编，也不要写进任何会进 git 的文件），
@@ -158,7 +158,7 @@ python scripts/smoke_stdio.py
 只需要装好、凭据你自己后面再填的话，一句话就够：
 
 ```text
-帮我接入天机电力气象 MCP：git clone <REPO_URL> ~/mcp/tianji-power-mcp 并
+帮我接入天机电力气象 MCP：git clone https://github.com/txZheng/tianji-power-mcp ~/mcp/tianji-power-mcp 并
 `pip install -e .`，然后按你当前宿主的 MCP 配置注册 stdio 服务
 （command 用 .venv/bin/python，args 用 -m tianji_power_mcp.server），凭据我稍后提供。
 ```

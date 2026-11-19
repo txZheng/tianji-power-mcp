@@ -21,6 +21,8 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://www.tjweather.com"
+Repository = "https://github.com/txZheng/tianji-power-mcp"
+Issues = "https://github.com/txZheng/tianji-power-mcp/issues"
 
 [project.scripts]
 tianji-power-mcp = "tianji_power_mcp.server:main"
