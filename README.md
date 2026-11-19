@@ -30,32 +30,143 @@
 - **额度自保护**：进程级调用预算、缓存 TTL、非法参数在发请求前拦截
 - **离线可测**：36 项单元测试全部基于真实响应 fixture，不联网、不需要凭据
 
-## 快速开始
+## 安装
+
+三种方式任选其一，都要求 **Python ≥ 3.10**。
+
+### 方式一：下载压缩包（不想装 git 的用户）
 
 ```bash
-git clone <repo-url> && cd tianji-power-mcp
-
+curl -LO https://github.com/<org>/tianji-power-mcp/archive/refs/heads/main.zip
+unzip main.zip && cd tianji-power-mcp-main
 python3 -m venv .venv
 .venv/bin/pip install -e .
-
-cp .env.example .env        # 填入你的 API key 与订阅 ID
 ```
 
-凭据从环境变量或工作区 `.env` 读取：
+如果 Releases 页面提供了打包好的版本，也可以直接下载对应 zip 解压。
+
+### 方式二：git clone
 
 ```bash
-TJW_API_KEY=...
-TJW_SUBSCRIPTION_ID=...
-# 可选：TJW_BASE_URL / TJW_MAX_CALLS
+git clone https://github.com/<org>/tianji-power-mcp.git
+cd tianji-power-mcp
+python3 -m venv .venv
+.venv/bin/pip install -e .
 ```
 
-启动（stdio 传输）：
+### 方式三：pip 直接安装（不用克隆）
 
 ```bash
-.venv/bin/python -m tianji_power_mcp.server
+pip install "git+https://github.com/<org>/tianji-power-mcp.git"
 ```
 
-接入选你用的宿主，例如：
+装完会得到 `tianji-power-mcp` 命令，可以直接作为宿主的启动命令：
+
+```bash
+tianji-power-mcp
+```
+
+用 [uv](https://docs.astral.sh/uv/) 的话可以更省事，连虚拟环境都不用建：
+
+```bash
+uvx --from "git+https://github.com/<org>/tianji-power-mcp.git" tianji-power-mcp
+```
+
+> 方式三没有项目目录，因此**无法读取 `.env`**，凭据要通过宿主的环境变量注入（见下文各宿主配置里的 `env` 字段）。
+
+## 配置凭据
+
+优先读环境变量，其次读工作区 `.env`（`.env` 已被 git 忽略，不会误提交）：
+
+```bash
+cp .env.example .env
+# 编辑 .env，填入你自己的 key 与订阅 ID
+```
+
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `TJW_API_KEY` | ✅ | 天机气象 API key |
+| `TJW_SUBSCRIPTION_ID` | ✅ | `/v2` 端点必需的订阅 ID（也接受 `real_sub_id`） |
+| `TJW_BASE_URL` | ❌ | 默认 `https://api.tjweather.com/v2` |
+| `TJW_MAX_CALLS` | ❌ | 进程级调用预算，默认 20 |
+
+## 启动
+
+这个服务走 **STDIO 传输**：没有端口、没有网页、没有交互界面，由宿主作为子进程拉起并对话。
+
+```bash
+tianji-power-mcp
+# 或：python -m tianji_power_mcp.server
+```
+
+在终端里直接运行会**静默等待**（在等 stdin 上的 JSON-RPC 消息），这是正常的，`Ctrl+C` 退出。想确认它是否健康，跑自检脚本（不消耗额度）：
+
+```bash
+python scripts/smoke_stdio.py
+```
+
+## 接入宿主
+
+所有宿主都需要这三个参数，只是写法不同：
+
+| 字段 | 值 |
+|---|---|
+| `command` | `tianji-power-mcp`（pip 安装）或 `<REPO_DIR>/.venv/bin/python`（源码安装） |
+| `args` | pip 安装留空；源码安装为 `["-m", "tianji_power_mcp.server"]` |
+| `env` | `TJW_API_KEY`、`TJW_SUBSCRIPTION_ID`（若不用 `.env`） |
+
+### DeepSeek Harness
+
+仓库里的 [`dsh-bundles/tianji-power`](dsh-bundles/tianji-power) 是一个可直接安装的 bundle（配置型，不含 JS 代码）。安装后由 `dsh-mcp-client` 按补丁里的配置拉起服务：
+
+```yaml
+# dsh-bundles/tianji-power/cordis.patch.yml（把 <REPO_DIR> 换成你的实际路径）
+dsh-mcp-client:
+  servers:
+    power:
+      serverName: power
+      transport: stdio
+      command: <REPO_DIR>/.venv/bin/python
+      args: ["-m", "tianji_power_mcp.server"]
+      cwd: <REPO_DIR>
+```
+
+把该目录装进 profile（用 `plugin_manager` 的 `install_bundle`，或在 profile 的 `cordis.yml` 里合并这段补丁），重启会话后工具会以 `mcp__power__*` 的名字出现。
+
+### WorkBuddy
+
+WorkBuddy 支持两级 MCP 配置，按需选一个：
+
+| 级别 | 路径 | 适用 |
+|---|---|---|
+| 用户级 | `~/.workbuddy/mcp.json` | 所有项目复用 |
+| 项目级 | `<项目目录>/.workbuddy/mcp.json` | 只在当前项目生效 |
+
+也可以在客户端里走可视化入口：侧边栏 **插件 → MCP 服务器**，然后填同样的配置。
+
+配置文件内容：
+
+```json
+{
+  "mcpServers": {
+    "tianji-power": {
+      "type": "stdio",
+      "command": "/absolute/path/to/.venv/bin/python",
+      "args": ["-m", "tianji_power_mcp.server"],
+      "cwd": "/absolute/path/to/tianji-power-mcp",
+      "env": {
+        "TJW_API_KEY": "你的 key",
+        "TJW_SUBSCRIPTION_ID": "你的订阅 ID"
+      },
+      "description": "天机气象 · 电力提示"
+    }
+  }
+}
+```
+
+用 pip 安装的话把 `command` 改成 `tianji-power-mcp`、`args` 留空即可。配置格式参见 [WorkBuddy MCP 文档](https://www.workbuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/MCP-Guide)。
+
+### 其它 JSON 型宿主（Claude Desktop / Cursor）
 
 ```json
 {
@@ -69,13 +180,19 @@ TJW_SUBSCRIPTION_ID=...
 }
 ```
 
-接好后直接用自然语言提问即可，例如：
+- Claude Desktop：`~/Library/Application Support/Claude/claude_desktop_config.json`（macOS）
+- Cursor：`~/.cursor/mcp.json`
+
+### 接入后怎么问
+
+接好之后直接用自然语言提问，不需要记参数：
 
 - 「大同未来 3 天风光情况如何」
 - 「112.55,37.87 明天有没有覆冰条件」
 - 「用切入 3、额定 13、切出 20、容量 5MW 算一下这里的理论出力」
+- 「这个点位光伏这周理论出力多少」
 
-坐标格式统一为 `经度,纬度`（经度在前）。
+坐标格式统一为 `经度,纬度`（经度在前）。工具返回里的 `data_gaps` 请一并转述，它说明这次判定缺了哪些要素。
 
 ## 工具
 
@@ -137,6 +254,10 @@ TJW_SUBSCRIPTION_ID=...
 ## 项目结构
 
 ```
+.env.example     凭据模板（复制成 .env 后填写）
+LICENSE          MIT
+SECURITY.md      凭据处理与漏洞报告约定
+dsh-bundles/     DeepSeek Harness 用的配置型 bundle
 src/tianji_power_mcp/
   config.py     配置与凭据（环境变量 > 工作区 .env）
   elements.py   要素注册表（ALL_FIELDS / 已授权 / 已拒 / 别名）
@@ -147,7 +268,7 @@ src/tianji_power_mcp/
   pv.py         光伏理论出力（辐照 × PR × 温度修正）
   server.py     MCP 工具定义
 tests/          36 项离线测试 + 真实响应 fixture
-scripts/        fetch_fixture.py / smoke_stdio.py / smoke_live.py
+scripts/        fetch_fixture.py（1 次额度）/ smoke_stdio.py（零额度）/ smoke_live.py（1 次额度）
 ```
 
 ## 开发与测试
