@@ -10,7 +10,7 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from . import __version__, daily, derive, elements, hints, power, pv
+from . import __version__, daily, derive, elements, hints, power, pv, render
 from .client import TianjiClient, TianjiError
 from .config import load_settings
 from .window import Window, parse_period, rolling_window
@@ -301,6 +301,68 @@ def daily_summary(
         pr=pr,
         tilt_gain=tilt_gain,
     )
+    result["window"] = {
+        "location": location,
+        **window.describe(),
+        "first": series.rows[0]["time"] if series.rows else None,
+        "last": series.rows[-1]["time"] if series.rows else None,
+    }
+    return _envelope(result, series)
+
+
+@server.tool(
+    description=(
+        "固版输出：按 profile 把分析固化成字节稳定的成稿（markdown），要点由规则从数据计算，"
+        "口径、警示与免责的位置固定。当前 profile：three_day_outlook（三日风光展望："
+        "逐日表 + 规则要点 + 数据说明，风光双算，功率参数可指定）。"
+        "period 支持人话时段（默认「未来3天」）。**成稿请原样转述给用户，数字与警示不得改写删减**；"
+        "如需补充解读，请在成稿之外另起说明。复用缓存，同坐标不额外消耗额度。"
+    )
+)
+def render_report(
+    location: str,
+    period: str = "未来3天",
+    profile: str = "three_day_outlook",
+    hub_height: float = 100.0,
+    cut_in: float = 3.0,
+    rated: float = 12.0,
+    cut_out: float = 25.0,
+    capacity_mw: float = 5.0,
+    curve: list[list[float]] | None = None,
+    pr: float = 0.82,
+    tilt_gain: float = 1.0,
+) -> dict:
+    profile = (profile or "").strip() or "three_day_outlook"
+    if profile not in render.PROFILES:
+        names = ", ".join(f"{key}（{value['title']}）" for key, value in render.PROFILES.items())
+        return _error(ValueError(f"未知 profile：{profile!r}；可用：{names}"))
+    try:
+        power.check_params(cut_in, rated, cut_out, hub_height, capacity_mw)
+        pv.check_params(capacity_mw, pr, -0.004, tilt_gain)
+        window = _window_for(period, 72)
+        series = _client().series_for_window(location, window)
+    except (ValueError, TianjiError) as exc:
+        return _error(exc)
+    empty = _require_rows(series, window)
+    if empty:
+        return empty
+    try:
+        result = render.render_profile(
+            series,
+            window,
+            location,
+            profile,
+            hub_height=hub_height,
+            cut_in=cut_in,
+            rated=rated,
+            cut_out=cut_out,
+            capacity_mw=capacity_mw,
+            curve=curve,
+            pr=pr,
+            tilt_gain=tilt_gain,
+        )
+    except ValueError as exc:
+        return _error(exc)
     result["window"] = {
         "location": location,
         **window.describe(),

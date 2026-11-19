@@ -68,8 +68,9 @@ def _mean_max(values: list[float], digits: int = 1) -> dict | None:
 
 
 def _wind_hours(rows, hub_height, cut_in, rated, cut_out, capacity_mw, curve, step):
-    """逐时理论出力 → (能量 MWh, 零出力小时, 切出小时, 峰值 MW)。"""
+    """逐时理论出力 → (能量 MWh, 零出力小时, 切出小时, 峰值 MW, 峰值时刻)。"""
     energy = zero = cut_out_h = peak = 0.0
+    peak_time = None
     for row in rows:
         hub_ws = wind_at_height(row.get("ws10m"), row.get("ws100m"), hub_height)
         pu = power.pu_from_curve(hub_ws, curve) if curve else power.pu_from_wind(hub_ws, cut_in, rated, cut_out)
@@ -79,19 +80,24 @@ def _wind_hours(rows, hub_height, cut_in, rated, cut_out, capacity_mw, curve, st
             zero += step
         if hub_ws is not None and hub_ws >= cut_out:
             cut_out_h += step
-        peak = max(peak, mw)
-    return energy, zero, cut_out_h, peak
+        if mw > peak:
+            peak = mw
+            peak_time = row.get("time")
+    return energy, zero, cut_out_h, peak, peak_time
 
 
 def _pv_hours(rows, capacity_mw, pr, tilt_gain, step):
-    """逐时光伏出力 → (能量 MWh, 峰值 MW, 有光行数)。"""
+    """逐时光伏出力 → (能量 MWh, 峰值 MW, 有光行数, 峰值时刻)。"""
     energy = peak = 0.0
     daylight = 0
+    peak_time = None
     for row in rows:
         pu = pv.pu_from_ghi(row.get("ssrd"), row.get("t2m"), pr=pr, tilt_gain=tilt_gain)
         mw = pu * capacity_mw
         energy += mw * step
-        peak = max(peak, mw)
+        if mw > peak:
+            peak = mw
+            peak_time = row.get("time")
         raw = row.get("ssrd")
         if raw is None:
             continue
@@ -100,7 +106,7 @@ def _pv_hours(rows, capacity_mw, pr, tilt_gain, step):
                 daylight += 1
         except (TypeError, ValueError):
             continue
-    return energy, peak, daylight
+    return energy, peak, daylight, peak_time
 
 
 def daily_summary(
@@ -187,13 +193,14 @@ def daily_summary(
             tp_total += sum(tp)
 
         if want_wind:
-            energy, zero, cut_out_h, peak = _wind_hours(
+            energy, zero, cut_out_h, peak, peak_time = _wind_hours(
                 day_rows, hub_height, cut_in, rated, cut_out, capacity_mw, curve, step
             )
             entry["wind"] = {
                 "energy_mwh": _round(energy, 1),
                 "mean_mw": _round(energy / hours, 3) if hours else None,
                 "peak_mw": _round(peak, 3),
+                "peak_time": peak_time,
                 "capacity_factor": _round(energy / (capacity_mw * hours), 4) if hours and capacity_mw else None,
                 "zero_output_hours": round(zero, 2),
                 "cut_out_hours": round(cut_out_h, 2),
@@ -203,11 +210,12 @@ def daily_summary(
             wind_peak = max(wind_peak, peak)
 
         if want_pv:
-            energy, peak, daylight = _pv_hours(day_rows, capacity_mw, pr, tilt_gain, step)
+            energy, peak, daylight, peak_time = _pv_hours(day_rows, capacity_mw, pr, tilt_gain, step)
             entry["pv"] = {
                 "energy_mwh": _round(energy, 1),
                 "mean_mw": _round(energy / hours, 3) if hours else None,
                 "peak_mw": _round(peak, 3),
+                "peak_time": peak_time,
                 "capacity_factor": _round(energy / (capacity_mw * hours), 4) if hours and capacity_mw else None,
                 "daylight_hours": daylight,
             }

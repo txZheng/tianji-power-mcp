@@ -29,6 +29,7 @@
 - **要素注册表驱动**：未授权要素在组装请求前就被挡掉，不会因为一个坏字段让整次请求失败
 - **起报对齐**：自动识别最新起报（05:00 / 17:00 切换）与可取时长，多要余量后裁到请求窗口；覆盖不足会明确报告，而不是悄悄少给
 - **逐日汇总**：`daily_summary` 按自然日聚合出日表，首/末日不足整天会标注时段，降水按小时率求和；可附逐日理论电量（演示模型）
+- **固版输出**：`render_report` 按模板把分析固化成**字节稳定**的成稿，要点由规则生成，警示与免责位置固定（金样本测试锁格式，改格式必须升 `format_version`）
 - **额度自保护**：进程级调用预算、缓存 TTL、非法参数在发请求前拦截；每次真实请求落盘台账，`get_capability` 可查今日用量
 - **离线可测**：77 项离线测试（真实响应 fixture + 合成数据），不联网、不需要凭据；push 到 GitHub 后 CI 自动再跑一遍
 
@@ -253,7 +254,7 @@ WorkBuddy 支持两级 MCP 配置，按需选一个：
 
 接好之后直接用自然语言提问，不需要记参数：
 
-- 「大同未来 3 天风光情况如何」（`daily_summary` 直接出逐日表）
+- 「大同未来 3 天风光情况如何」（`render_report` 出固版成稿；要结构数据则用 `daily_summary`）
 - 「112.55,37.87 明天有没有覆冰条件」
 - 「用切入 3、额定 13、切出 20、容量 5MW 算一下这里的理论出力」
 - 「这个点位光伏这周理论出力多少」
@@ -270,6 +271,7 @@ WorkBuddy 支持两级 MCP 配置，按需选一个：
 | `wind_solar_snapshot` | 风电/光伏关键要素逐时快照 | 首次 1 次 |
 | `theoretical_power` | 理论出力演示，`kind="wind"` 或 `kind="pv"` | 首次 1 次 |
 | `daily_summary` | 逐日汇总：按自然日聚合成日表（首/末日标注时段、降水求和），`kind=wind/pv/both` 附逐日理论电量 | 首次 1 次，之后复用缓存 |
+| `render_report` | 固版输出：按 profile 渲染字节稳定的成稿（当前 `three_day_outlook`：三日风光展望） | 首次 1 次，之后复用缓存 |
 
 ### 窗口怎么定：`period` 与 `hours`
 
@@ -368,11 +370,12 @@ src/tianji_power_mcp/
   client.py     /v2 客户端：一次取齐 + 投影、预算、缓存、要素剔除
   derive.py     派生量：露点、风切变、轮毂风速、风力等级、降水相态
   daily.py      逐日汇总（自然日聚合 + 可选逐日理论电量）
+  render.py     固版输出（profile 注册表 + 字节稳定成稿）
   hints.py      提示规则引擎与事件合并
   power.py      风电理论出力（功率曲线）
   pv.py         光伏理论出力（辐照 × PR × 温度修正）
   server.py     MCP 工具定义
-tests/          77 项离线测试 + 真实响应 fixture
+tests/          86 项离线测试 + 真实响应 fixture + 固版金样本
 scripts/        fetch_fixture.py（1 次额度）/ smoke_stdio.py（零额度）/ smoke_live.py（1 次额度）
 ```
 
@@ -386,6 +389,12 @@ scripts/        fetch_fixture.py（1 次额度）/ smoke_stdio.py（零额度）
 
 推送后 GitHub Actions（`.github/workflows/ci.yml`）会在 Python 3.10 / 3.13 上自动跑同一套离线测试。
 
+固版格式由金样本锁定（`tests/fixtures/*.golden.md`）。**有意**修改格式时：升 `format_version` → 重生成金样本 → 人工审阅 → CHANGELOG 记一条。重生成命令：
+
+```bash
+.venv/bin/python -c "import tests.test_offline as t; from tianji_power_mcp import render; s,w=t.RenderProfileTest._fixture(); open('tests/fixtures/render_three_day_outlook.golden.md','w',encoding='utf-8').write(render.render_profile(s,w,'112.55,37.87')['markdown'])"
+```
+
 调试时**不要用 `print()`** 往 stdout 写东西——stdio 传输下 stdout 就是协议通道，会污染协议流。日志请写 `sys.stderr`。
 
 ## 版本
@@ -398,7 +407,7 @@ scripts/        fetch_fixture.py（1 次额度）/ smoke_stdio.py（零额度）
 | `src/tianji_power_mcp/__init__.py` | 运行时版本，MCP 握手时作为 `serverInfo.version` 上报 |
 | `dsh-bundles/tianji-power/package.json` | DSH 插件包的 npm 版本，与包版本保持一致 |
 
-改完代码按[语义化版本](https://semver.org/lang/zh-CN/)递增（修 bug 加第三位、加功能加第二位、不兼容升主版本），在 [CHANGELOG.md](CHANGELOG.md) 记一条，再打同名 tag（如 `v0.1.1`）。当前：**0.4.0**。
+改完代码按[语义化版本](https://semver.org/lang/zh-CN/)递增（修 bug 加第三位、加功能加第二位、不兼容升主版本），在 [CHANGELOG.md](CHANGELOG.md) 记一条，再打同名 tag（如 `v0.1.1`）。当前：**0.5.0**。
 
 ## 许可
 

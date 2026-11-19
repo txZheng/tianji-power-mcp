@@ -6,6 +6,24 @@
 
 ## [未发布]
 
+## [0.5.0] - 2026-11-19
+
+### 新增
+
+- 固版输出：新工具 `render_report`，按 profile 把分析固化成**字节稳定**的 markdown 成稿——同一份取数产出一字不差的输出；「要点」由规则从数据计算（极值 / 阈值命中 / 缺口声明），口径、警示与免责的位置固定；工具描述要求成稿原样转述，数字与警示不得改写删减
+- 首个 profile：`three_day_outlook`（三日风光展望：逐日表 + 规则要点 + 数据说明，风光双算，功率参数可指定，`period` 默认「未来3天」）
+- `daily_summary` 的风电 / 光伏日块新增 `peak_time`（首个峰值出现时刻）
+- 金样本测试：`tests/fixtures/render_three_day_outlook.golden.md` 锁定格式；**有意**改格式必须升 `format_version`、重做金样本并记 CHANGELOG，CI 看护
+
+### 设计契约
+
+- profile 是纯函数；溯源只写数据属性（起报时刻、窗口），不写渲染时间
+- 返回 markdown 的同时携带结构化 payload（daily / events / data_gaps），供追问与非 LLM 消费者复用
+
+### 测试
+
+- 离线测试 77 → 86 项
+
 ## [0.4.0] - 2026-11-19
 
 ### 新增

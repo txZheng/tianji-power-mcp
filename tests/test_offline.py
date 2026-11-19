@@ -8,7 +8,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from tianji_power_mcp import daily, derive, elements, hints, power, pv
+from tianji_power_mcp import daily, derive, elements, hints, power, pv, render
 from tianji_power_mcp.client import (
     BudgetExhausted,
     FieldDenied,
@@ -332,6 +332,7 @@ class ServerRegistrationTest(unittest.TestCase):
                 "wind_solar_snapshot",
                 "theoretical_power",
                 "daily_summary",
+                "render_report",
                 "get_dataset",
             },
             names,
@@ -666,6 +667,7 @@ class DailySummaryTest(unittest.TestCase):
         out = daily.daily_summary(rows, kind="wind", capacity_mw=5.0)
         self.assertEqual(out["days"][0]["wind"]["energy_mwh"], 120.0, "额定 5MW × 24h")
         self.assertAlmostEqual(out["days"][0]["wind"]["capacity_factor"], 1.0, places=3)
+        self.assertEqual(out["days"][0]["wind"]["peak_time"], rows[0]["time"], "峰值时刻=首个最大值行")
 
     def test_pv_energy_matches_hourly_simulation(self):
         rows = self._rows(datetime(2026, 11, 20, 0, 0, tzinfo=CST), 24, t2m=25.0)
@@ -676,6 +678,7 @@ class DailySummaryTest(unittest.TestCase):
         sim = pv.simulate(rows, capacity_mw=5.0)
         self.assertAlmostEqual(out["totals"]["pv"]["energy_mwh"], sim["summary"]["energy_mwh"], places=1)
         self.assertEqual(out["days"][0]["pv"]["daylight_hours"], sim["summary"]["daylight_hours"])
+        self.assertEqual(out["days"][0]["pv"]["peak_time"], rows[10]["time"], "光伏峰值=首个最大值行")
 
     def test_kind_general_has_no_power_columns(self):
         rows = self._rows(datetime(2026, 11, 20, 0, 0, tzinfo=CST), 24)
@@ -867,6 +870,158 @@ class DiskCacheTest(unittest.TestCase):
         series = client.series_for_window("112.55,37.87", rolling_window(12, self.NOW))
         self.assertEqual(client.calls, 1, "损坏条目当作没有，正常取数")
         self.assertEqual(len(series.rows), 12)
+
+
+class RenderProfileTest(unittest.TestCase):
+    """固版输出：字节稳定、要点规则、金样本锁格式。"""
+
+    GOLDEN = Path(__file__).parent / "fixtures" / "render_three_day_outlook.golden.md"
+
+    @staticmethod
+    def _fixture():
+        """固定合成数据：11-19 16时 → 11-22 24时，共 80 行。"""
+        from tianji_power_mcp.client import Coverage, Series
+
+        start = datetime(2026, 11, 19, 16, 0, tzinfo=CST)
+        cloud = {"19": 0.60, "20": 0.00, "21": 0.00, "22": 0.13}
+        rows = []
+        for i in range(80):
+            moment = start + timedelta(hours=i)
+            rows.append(
+                {
+                    "time": iso(moment),
+                    "t2m": 10.0,
+                    "rh2m": 60.0,
+                    "ws10m": 2.0,
+                    "ws100m": 12.0,
+                    "wd100m": 180.0,
+                    "tp": 0.0,
+                    "pres": 0.0,
+                    "cldt": cloud.get(moment.strftime("%d"), 0.0),
+                    "ssrd": 600.0 if 10 <= moment.hour <= 16 else 0.0,
+                }
+            )
+        rows[37]["t2m"] = 3.2  # 11-21 05时，全窗口最低
+        rows[70]["t2m"] = 16.1  # 11-22 14时，全窗口最高
+        for i in range(40, 47):  # 11-21 08~14时低于切入风速，零出力 7h
+            rows[i]["ws100m"] = 2.0
+            rows[i]["ws10m"] = 1.0
+        window = Window(start, start + timedelta(hours=80), "未来3天", "future_days")
+        coverage = Coverage(
+            requested_from=iso(window.start),
+            requested_to=iso(window.end),
+            run_time_init="2026-11-19T08:00+08:00",
+            data_from=rows[0]["time"],
+            data_to=rows[-1]["time"],
+            complete=True,
+            fcst_days=4,
+        )
+        series = Series(
+            rows=rows,
+            fields=["t2m", "rh2m", "ws10m", "ws100m", "wd100m", "tp", "pres", "cldt", "ssrd"],
+            time_init="2026-11-19T08:00+08:00",
+            coverage=coverage,
+            dataset_rows=80,
+            fcst_days=4,
+        )
+        return series, window
+
+    def _render(self):
+        series, window = self._fixture()
+        return render.render_profile(series, window, "112.55,37.87"), series
+
+    def test_golden_three_day_outlook(self):
+        out, _ = self._render()
+        self.assertTrue(self.GOLDEN.is_file(), "缺少金样本：先生成并人工审阅后再提交")
+        self.assertEqual(
+            out["markdown"],
+            self.GOLDEN.read_text(encoding="utf-8"),
+            "与金样本不一致：改格式必须升 format_version 并重做金样本",
+        )
+
+    def test_byte_stable(self):
+        first, _ = self._render()
+        second, _ = self._render()
+        self.assertEqual(first["markdown"], second["markdown"])
+
+    def test_partial_day_annotated(self):
+        out, _ = self._render()
+        self.assertIn("首日仅 8 小时", out["markdown"])
+
+    def test_no_precip_phrase(self):
+        out, _ = self._render()
+        self.assertIn("- 降水：全程无有效降水", out["markdown"])
+
+    def test_zero_output_and_peak_time(self):
+        out, _ = self._render()
+        self.assertIn("零出力合计 7h", out["markdown"])
+        self.assertIn("（11-19 16时）", out["markdown"])
+
+    def test_risk_line_lists_events(self):
+        series, window = self._fixture()
+        for row in series.rows:
+            row["ws10m"] = 20.0  # 全程 8 级大风
+        out = render.render_profile(series, window, "112.55,37.87")
+        self.assertIn("大风1段（共80h）", out["markdown"])
+
+    def test_single_day_phrasing(self):
+        from tianji_power_mcp.client import Coverage, Series
+
+        series, _ = self._fixture()
+        day_rows = [row for row in series.rows if row["time"].startswith("2026-11-20")]
+        window = Window(
+            datetime(2026, 11, 20, tzinfo=CST),
+            datetime(2026, 11, 21, tzinfo=CST),
+            "明天",
+            "calendar",
+        )
+        single = Series(
+            rows=day_rows,
+            fields=series.fields,
+            time_init=series.time_init,
+            coverage=Coverage(
+                requested_from=iso(window.start),
+                requested_to=iso(window.end),
+                run_time_init=series.time_init,
+                data_from=day_rows[0]["time"],
+                data_to=day_rows[-1]["time"],
+                complete=True,
+                fcst_days=4,
+            ),
+        )
+        out = render.render_profile(single, window, "112.55,37.87")
+        self.assertIn("- 风电：本时段 120.0 MWh", out["markdown"])
+        self.assertNotIn("最大日", out["markdown"])
+
+
+class RenderToolTest(unittest.TestCase):
+    """server 层：render_report 返回成稿与 payload，未知 profile 报错。"""
+
+    def setUp(self):
+        from tianji_power_mcp import server as srv
+
+        self.srv = srv
+        self.fake = FakeClient(capacity=48)
+        self._original = srv._client
+        srv._client = lambda: self.fake  # type: ignore[assignment]
+
+    def tearDown(self):
+        self.srv._client = self._original  # type: ignore[assignment]
+
+    def test_render_report_returns_markdown_and_payload(self):
+        result = self.srv.render_report("112.55,37.87", period="明天")
+        self.assertTrue(result["ok"])
+        data = result["data"]
+        self.assertEqual(data["profile"], "three_day_outlook")
+        self.assertEqual(data["format_version"], 1)
+        self.assertIn("风光展望", data["markdown"])
+        self.assertIn("覆盖：", data["markdown"])
+        self.assertIn("daily", data["payload"])
+
+    def test_render_report_unknown_profile(self):
+        result = self.srv.render_report("112.55,37.87", profile="nope")
+        self.assertFalse(result["ok"])
+        self.assertIn("profile", result["error"])
 
 
 if __name__ == "__main__":
