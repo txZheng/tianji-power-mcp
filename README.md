@@ -352,14 +352,15 @@ scripts/        fetch_fixture.py（1 次额度）/ smoke_stdio.py（零额度）
 
 ## 版本
 
-本仓库有两个版本号，改动时一起看：
+版本号只有一个，写在三处，发布时一起改：
 
-| 版本号 | 位置 | 含义 |
-|---|---|---|
-| Python 包 | `pyproject.toml`、`src/tianji_power_mcp/__init__.py` | 使用者安装到的版本，也是 `serverInfo.version` 报的值 |
-| DSH bundle | `dsh-bundles/tianji-power/package.json` | DeepSeek Harness 插件包版本，只在 bundle 内容变化时递增 |
+| 文件 | 作用 |
+|---|---|
+| `pyproject.toml` | Python 包元数据，`pip show` / PyPI 上显示的值 |
+| `src/tianji_power_mcp/__init__.py` | 运行时版本，MCP 握手时作为 `serverInfo.version` 上报 |
+| `dsh-bundles/tianji-power/package.json` | DSH 插件包的 npm 版本，与包版本保持一致 |
 
-改完代码按[语义化版本](https://semver.org/lang/zh-CN/)递增（修 bug 加第三位、加功能加第二位、不兼容升主版本），并在 [CHANGELOG.md](CHANGELOG.md) 记一条。当前：Python 包 **0.1.1**，DSH bundle **1.0.1**。
+改完代码按[语义化版本](https://semver.org/lang/zh-CN/)递增（修 bug 加第三位、加功能加第二位、不兼容升主版本），在 [CHANGELOG.md](CHANGELOG.md) 记一条，再打同名 tag（如 `v0.1.1`）。当前：**0.1.1**。
 
 ## 许可
 

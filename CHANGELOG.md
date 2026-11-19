@@ -2,16 +2,11 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-本仓库有两个版本号，改的时候一起看：
-
-- **Python 包版本**：写在 `pyproject.toml` 与 `src/tianji_power_mcp/__init__.py`，是使用者安装到的版本，也是 MCP 握手时 `serverInfo.version` 报的值
-- **DSH bundle 版本**：写在 `dsh-bundles/tianji-power/package.json`，是 DeepSeek Harness 插件包的版本，只在 bundle 自身内容变化时递增
+本仓库只有一个版本号，同时写在三处（`pyproject.toml`、`src/tianji_power_mcp/__init__.py`、`dsh-bundles/tianji-power/package.json`），改的时候一起改。
 
 ## [未发布]
 
 ## [0.1.1] - 2026-11-19
-
-对应 DSH bundle 1.0.1。
 
 ### 修复
 
