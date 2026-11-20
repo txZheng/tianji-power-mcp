@@ -317,6 +317,169 @@ class CredentialFileTest(unittest.TestCase):
                     os.environ[k] = v
 
 
+class ConfigDiscoveryTest(unittest.TestCase):
+    """0.5.2 凭据定位：向上搜索与 cwd 无关；.env 不遮蔽；状态根锚定凭据目录。"""
+
+    def setUp(self):
+        import os
+
+        import tianji_power_mcp.config as config
+
+        self._config = config
+        self._watched = (
+            "TJW_CREDENTIAL_FILE",
+            "TJW_API_KEY",
+            "TIANJI_API_KEY",
+            "TJW_SUBSCRIPTION_ID",
+            "real_sub_id",
+            "TIANJI_SUBSCRIPTION_ID",
+        )
+        self._saved = {k: os.environ.get(k) for k in self._watched}
+        for k in self._watched:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        import os
+
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    @staticmethod
+    def _fake_venv(root: Path) -> Path:
+        """模拟「包被 pip 装进部署目录 venv」的布局，返回假的包目录。"""
+        pkg = root / ".venv/lib/python3.13/site-packages/tianji_power_mcp"
+        pkg.mkdir(parents=True)
+        return pkg
+
+    def test_walk_up_candidates_ordered_before_cwd(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".tjweather-rc").write_text(
+                "TJW_API_KEY=k1\nTJW_SUBSCRIPTION_ID=s1\n", encoding="utf-8"
+            )
+            pkg = self._fake_venv(root)
+            candidates = self._config._candidate_files(package_dir=pkg)
+            # 第一候选是包自身目录，向上各级排在 cwd 之前
+            self.assertEqual(candidates[0], pkg / ".tjweather-rc")
+            self.assertIn(root / ".tjweather-rc", candidates)
+            cwd_candidate = Path.cwd() / ".tjweather-rc"
+            if cwd_candidate in candidates:
+                self.assertLess(
+                    candidates.index(root / ".tjweather-rc"),
+                    candidates.index(cwd_candidate),
+                )
+            # 旧版 .env 永远排在所有 .tjweather-rc 之后
+            self.assertGreater(
+                candidates.index(pkg / ".env"),
+                candidates.index(root / ".tjweather-rc"),
+            )
+
+    def test_load_settings_ignores_cwd(self):
+        import os
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".tjweather-rc").write_text(
+                "TJW_API_KEY=k2\nTJW_SUBSCRIPTION_ID=s2\n", encoding="utf-8"
+            )
+            pkg = self._fake_venv(root)
+            elsewhere = root / "session-workspace"  # 模拟宿主把 cwd 设成会话工作区
+            elsewhere.mkdir()
+            old_cwd = Path.cwd()
+            os.chdir(elsewhere)
+            try:
+                with mock.patch.object(self._config, "_package_dir", return_value=pkg):
+                    settings = self._config.load_settings()
+                self.assertEqual(settings.api_key, "k2")
+                self.assertEqual(settings.subscription_id, "s2")
+            finally:
+                os.chdir(old_cwd)
+
+    def test_runtime_root_anchors_to_credential_dir(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".tjweather-rc").write_text(
+                "TJW_API_KEY=k\nTJW_SUBSCRIPTION_ID=s\n", encoding="utf-8"
+            )
+            pkg = self._fake_venv(root)
+            self.assertEqual(self._config._discover_runtime_root(package_dir=pkg), root)
+
+    def test_runtime_root_falls_back_to_project_root(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pkg = self._fake_venv(root)  # 整棵树没有任何凭据文件
+            empty = root / "workspace"
+            empty.mkdir()
+            old_cwd = Path.cwd()
+            os.chdir(empty)
+            try:
+                self.assertEqual(
+                    self._config._discover_runtime_root(package_dir=pkg),
+                    self._config.PROJECT_ROOT,
+                )
+            finally:
+                os.chdir(old_cwd)
+
+    def test_keyless_file_does_not_block_later_candidates(self):
+        import os
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pkg = self._fake_venv(root)
+            # 先命中的 .tjweather-rc 不含凭据 → 继续读排在后面的 .env（包目录下）
+            (root / ".tjweather-rc").write_text("# 占位，没有凭据\n", encoding="utf-8")
+            (pkg / ".env").write_text(
+                "TJW_API_KEY=k4\nTJW_SUBSCRIPTION_ID=s4\n", encoding="utf-8"
+            )
+            empty = root / "workspace"  # 隔离 cwd，避免读到真实仓库里的 .tjweather-rc
+            empty.mkdir()
+            old_cwd = Path.cwd()
+            os.chdir(empty)
+            try:
+                with mock.patch.object(self._config, "_package_dir", return_value=pkg):
+                    settings = self._config.load_settings()
+                self.assertEqual(settings.api_key, "k4")
+                self.assertEqual(settings.subscription_id, "s4")
+            finally:
+                os.chdir(old_cwd)
+
+    def test_missing_credentials_error_lists_searched_locations(self):
+        import os
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pkg = self._fake_venv(root)
+            empty = root / "workspace"
+            empty.mkdir()
+            old_cwd = Path.cwd()
+            os.chdir(empty)
+            try:
+                with mock.patch.object(self._config, "_package_dir", return_value=pkg):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        self._config.load_settings()
+                message = str(ctx.exception)
+                self.assertIn("TJW_CREDENTIAL_FILE", message)
+                self.assertIn(str(pkg), message)  # 报错里能看到搜索过的位置
+            finally:
+                os.chdir(old_cwd)
+
+
 class ServerRegistrationTest(unittest.TestCase):
     def test_tools_registered(self):
         import asyncio

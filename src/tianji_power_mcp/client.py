@@ -28,15 +28,17 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import elements
-from .config import PROJECT_ROOT, Settings, load_settings
+from .config import RUNTIME_ROOT, Settings, load_settings
 from .window import CST, Window, expected_run_init, iso, now_cst, rolling_window
 
 CACHE_TTL_SECONDS = 600.0
-DENIED_STORE = PROJECT_ROOT / ".runtime" / "denied.json"
+# 状态目录锚定 RUNTIME_ROOT（0.5.2）：凭据文件所在的部署根——装进 venv 时是运行
+# 目录而非 venv 内部（venv 重建不丢缓存与台账）；源码运行时等于仓库根，行为不变
+DENIED_STORE = RUNTIME_ROOT / ".runtime" / "denied.json"
 # 额度台账：每次真实请求（含失败尝试）追加一行，get_capability 可查累计/今日用量
-USAGE_STORE = PROJECT_ROOT / ".runtime" / "usage.jsonl"
+USAGE_STORE = RUNTIME_ROOT / ".runtime" / "usage.jsonl"
 # 落盘缓存：整段取数结果写盘，跨进程复用；锚定起报，05:00/17:00 翻页即失效
-CACHE_DIR = PROJECT_ROOT / ".runtime" / "cache"
+CACHE_DIR = RUNTIME_ROOT / ".runtime" / "cache"
 # 落盘缓存的硬上限：有效条目天然不会超过一个起报周期（12 小时），24 小时只是兜底
 DISK_CACHE_MAX_AGE_SECONDS = 86400.0
 

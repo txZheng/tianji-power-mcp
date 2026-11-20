@@ -75,7 +75,7 @@ tianji-power-mcp
 uvx --from "git+https://github.com/txZheng/tianji-power-mcp.git" tianji-power-mcp
 ```
 
-> 方式三没有项目目录，因此**无法读取 `.tjweather-rc`**，凭据要通过宿主的环境变量注入（见下文各宿主配置里的 `env` 字段）。
+> 方式三装进 uv 的缓存目录，通常定位不到你的 `.tjweather-rc`，凭据建议通过宿主的环境变量注入（见下文各宿主配置里的 `env` 字段）。
 
 ## 配置凭据
 
@@ -87,9 +87,13 @@ uvx --from "git+https://github.com/txZheng/tianji-power-mcp.git" tianji-power-mc
 
 拿到 key 之后，凭据由服务自己读取，**宿主的 JSON 配置里不需要出现任何密钥**：
 
-- 读取顺序：`环境变量` > 凭据文件 `.tjweather-rc`（兼容旧的 `.env`）
-- 用 `pip install -e .`（源码方式）安装时，服务的 `PROJECT_ROOT` 就是仓库目录，因此**无论宿主把工作目录设成什么，都能读到仓库里的 `.tjweather-rc`**
-- 用 `pip install git+...`（非源码方式）安装时没有仓库目录，只能走环境变量
+- 读取顺序：环境变量 > `TJW_CREDENTIAL_FILE` 指定的文件 > 凭据文件 `.tjweather-rc`（兼容旧的 `.env`）
+- 服务从**包自身所在位置逐级向上**查找 `.tjweather-rc`（最多 8 层），因此**与宿主把工作目录设成什么无关**：
+  - `pip install -e .`（源码方式）→ 向上命中仓库根目录；
+  - 装进部署目录的 venv（如 `<运行目录>/.venv/...`）→ 向上命中该运行目录；
+  - `pip install git+...` / `uvx` 装进与凭据无关的位置 → 找不到凭据文件，走环境变量或 `TJW_CREDENTIAL_FILE`
+- 本地状态目录 `.runtime`（落盘缓存、额度台账）锚定在凭据文件所在目录；找不到任何凭据文件时退回包的 `PROJECT_ROOT`
+- 找不到凭据时的报错会列出全部搜索过的位置，按提示三选一即可
 
 `.tjweather-rc` 已被 git 忽略。建议再收紧权限，避免同机其它用户读到：
 
@@ -108,6 +112,7 @@ cp .tjweather-rc.example .tjweather-rc
 |---|---|---|
 | `TJW_API_KEY` | ✅ | 天机气象 API key |
 | `TJW_SUBSCRIPTION_ID` | ✅ | `/v2` 端点必需的订阅 ID（也接受 `real_sub_id`） |
+| `TJW_CREDENTIAL_FILE` | ❌ | 凭据文件绝对路径；不设则自动从包位置逐级向上查找 `.tjweather-rc` |
 | `TJW_BASE_URL` | ❌ | 默认 `https://api.tjweather.com/v2` |
 | `TJW_MAX_CALLS` | ❌ | 进程级调用预算，默认 20 |
 | `TJW_RUN_LAG_HOURS` | ❌ | 起报可用滞后，默认 9（08 时起报 17:00 可用、20 时起报次日 05:00 可用） |
@@ -138,7 +143,7 @@ python scripts/smoke_stdio.py
 |---|---|
 | `command` | `tianji-power-mcp`（pip 安装）或 `<REPO_DIR>/.venv/bin/python`（源码安装） |
 | `args` | pip 安装留空；源码安装为 `["-m", "tianji_power_mcp.server"]` |
-| `env` | `TJW_API_KEY`、`TJW_SUBSCRIPTION_ID`（若不用凭据文件） |
+| `env` | 通常留空（服务自己定位凭据文件）；定位不到时给 `TJW_CREDENTIAL_FILE`，或 `TJW_API_KEY`+`TJW_SUBSCRIPTION_ID` |
 
 ### 让 agent 自己接入（推荐）
 
