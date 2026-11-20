@@ -17,3 +17,6 @@ dist/
 .idea/
 .vscode/
 node_modules/
+
+# 本地交接笔记（含本机路径与运维细节，不入公库）
+HANDOFF.md
