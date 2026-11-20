@@ -6,6 +6,12 @@
 
 ## [未发布]
 
+## [0.5.1] - 2026-11-20
+
+### 修复
+
+- 构建元数据现代化（PEP 639）：`license` 改为 SPDX 表达式 `"MIT"` 并声明 `license-files`，移除弃用的 `License :: OSI Approved :: MIT License` classifier，构建要求升到 `setuptools>=77`。`promote.sh` / CI 构建不再刷屏 BuildBackendWarning（setuptools 官方 2027-02-18 后不再支持旧写法）
+
 ## [0.5.0] - 2026-11-19
 
 ### 新增

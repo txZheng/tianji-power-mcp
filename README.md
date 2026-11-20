@@ -407,7 +407,7 @@ scripts/        fetch_fixture.py（1 次额度）/ smoke_stdio.py（零额度）
 | `src/tianji_power_mcp/__init__.py` | 运行时版本，MCP 握手时作为 `serverInfo.version` 上报 |
 | `dsh-bundles/tianji-power/package.json` | DSH 插件包的 npm 版本，与包版本保持一致 |
 
-改完代码按[语义化版本](https://semver.org/lang/zh-CN/)递增（修 bug 加第三位、加功能加第二位、不兼容升主版本），在 [CHANGELOG.md](CHANGELOG.md) 记一条，再打同名 tag（如 `v0.1.1`）。当前：**0.5.0**。
+改完代码按[语义化版本](https://semver.org/lang/zh-CN/)递增（修 bug 加第三位、加功能加第二位、不兼容升主版本），在 [CHANGELOG.md](CHANGELOG.md) 记一条，再打同名 tag（如 `v0.1.1`）。当前：**0.5.1**。
 
 ## 许可
 
